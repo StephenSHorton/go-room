@@ -1,10 +1,12 @@
 // Package room lets two or more copies of an app find each other with no
-// account and no server of their own, and then talk directly over WebRTC
-// data channels.
+// account, and then talk directly over WebRTC data channels.
 //
-// Signaling (presence, offers and answers) goes over free public MQTT
-// brokers, sealed with a key derived from a shared secret, so the brokers see
-// only random bytes on a random-looking topic. Once two members have found
+// Signaling (presence, offers and answers) is sealed with a key derived
+// from a shared secret and goes over one or more carriers: the local
+// network (OpenLAN), a hub on one of the app's own machines (NewHub,
+// DialHub, with NewTURN and package portmap beside it), or public MQTT
+// brokers (package mqtt). Every carrier sees only random bytes on a
+// random-looking topic. Once two members have found
 // each other, Mesh opens a pion PeerConnection between them, binds it to each
 // side's ed25519 identity with a signed-fingerprint handshake, and hands the
 // app one reliable ordered message channel plus on-demand byte streams.
