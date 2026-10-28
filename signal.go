@@ -79,10 +79,11 @@ type SignalOptions struct {
 	// OnConnect fires whenever a carrier (re)connects, so callers can
 	// announce themselves.
 	OnConnect func()
-	// OnHeard, when set, gets the sender and source address of every
-	// authentic envelope that arrived with one (the LAN carrier), duplicates
-	// included: how an app learns where a member is on the local network.
-	// It runs on the carrier's receive goroutine.
+	// OnHeard, when set, gets the sender and source address of an
+	// authentic envelope that arrived with one (the LAN carrier): the first
+	// copy of each envelope that came with an address, even when another
+	// carrier delivered it first. How an app learns where a member is on the
+	// local network. It runs on the carrier's receive goroutine.
 	OnHeard func(from string, addr netip.AddrPort)
 }
 
@@ -124,7 +125,7 @@ type sigCore struct {
 	now    func() time.Time
 
 	mu     sync.Mutex
-	seen   map[string]time.Time
+	seen   map[string]seenID
 	rtc    func(Envelope)
 	closed bool
 }
@@ -140,7 +141,16 @@ func newCore(s Secret, self string, o SignalOptions) (*sigCore, error) {
 	if maxAge <= 0 {
 		maxAge = DefaultMaxAge
 	}
-	return &sigCore{self: self, key: s.Key, topic: s.Topic, maxAge: maxAge, onMsg: o.OnMsg, heard: o.OnHeard, now: time.Now, seen: map[string]time.Time{}}, nil
+	return &sigCore{self: self, key: s.Key, topic: s.Topic, maxAge: maxAge, onMsg: o.OnMsg, heard: o.OnHeard, now: time.Now, seen: map[string]seenID{}}, nil
+}
+
+// seenID is one envelope id already received: when, and whether a copy of
+// it with a source address has taught a leg (and OnHeard) where its sender
+// is. Only that first addressed copy does, so a host that captures a
+// datagram and sends it again from its own address can't move the sender.
+type seenID struct {
+	at   time.Time
+	addr bool
 }
 
 // seal builds and seals one envelope.
@@ -194,21 +204,15 @@ func (c *sigCore) open(payload []byte) (Envelope, bool) {
 // receive opens, checks, de-duplicates and routes one payload.
 func (c *sigCore) receive(payload []byte) { c.receiveFrom(payload, nil, netip.AddrPort{}) }
 
-// receiveFrom is receive for a payload leg delivered from addr: an authentic
-// one is reported to the leg (and OnHeard) before de-duplication, so a
-// carrier learns every path a member is heard on, not only the fastest.
+// receiveFrom is receive for a payload leg delivered from addr. The first
+// copy of an envelope that arrives with an address is reported to the leg
+// (and OnHeard) even if another carrier's copy came first, so the LAN
+// carrier learns a member's address when the hub is faster; later copies
+// of the same envelope teach nothing (see seenID).
 func (c *sigCore) receiveFrom(payload []byte, leg Leg, from netip.AddrPort) {
 	env, ok := c.open(payload)
 	if !ok {
 		return
-	}
-	if from.IsValid() {
-		if leg != nil {
-			leg.Seen(env.From, from)
-		}
-		if c.heard != nil && !c.isClosed() {
-			c.heard(env.From, from)
-		}
 	}
 	now := c.now()
 	c.mu.Lock()
@@ -216,20 +220,33 @@ func (c *sigCore) receiveFrom(payload []byte, leg Leg, from netip.AddrPort) {
 		c.mu.Unlock()
 		return
 	}
-	if _, dup := c.seen[env.ID]; dup {
-		c.mu.Unlock()
-		return
+	prev, dup := c.seen[env.ID]
+	learn := from.IsValid() && !prev.addr
+	if !dup {
+		prev.at = now
 	}
-	c.seen[env.ID] = now
+	prev.addr = prev.addr || from.IsValid()
+	c.seen[env.ID] = prev
 	if len(c.seen) > seenCap {
-		for id, t := range c.seen {
-			if now.Sub(t) > 2*c.maxAge {
+		for id, s := range c.seen {
+			if now.Sub(s.at) > 2*c.maxAge {
 				delete(c.seen, id)
 			}
 		}
 	}
 	rtc := c.rtc
 	c.mu.Unlock()
+	if learn {
+		if leg != nil {
+			leg.Seen(env.From, from)
+		}
+		if c.heard != nil {
+			c.heard(env.From, from)
+		}
+	}
+	if dup {
+		return
+	}
 	if strings.HasPrefix(env.Type, RTCPrefix) {
 		if rtc != nil {
 			rtc(env)

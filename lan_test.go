@@ -138,10 +138,76 @@ func TestLANTagWindows(t *testing.T) {
 	_ = a.Send("", "t", nil)
 	recvEnv(t, got, "previous window")
 	noEnv(t, got, "other room")
+	// b's clock is one window behind (the sender's is ahead): the sender's
+	// tag is b's next window, also accepted.
+	clock.Store(time.Now().Add(-lanWindow * time.Second).UnixNano())
+	_ = a.Send("", "t", nil)
+	recvEnv(t, got, "next window")
 	// Two windows ahead: dropped unopened.
 	clock.Store(time.Now().Add(2 * lanWindow * time.Second).UnixNano())
 	_ = a.Send("", "t", nil)
 	noEnv(t, got, "stale window")
+}
+
+// A host that captures a member's datagram and sends it again from its own
+// address doesn't become where that member is.
+func TestLANReplayDoesntMoveAMember(t *testing.T) {
+	n := NewMemLAN()
+	s := testSecret(t)
+	var mu sync.Mutex
+	var captured []byte
+	la := memLANNode(t, n, "10.0.0.1:38419", nil)
+	lb := memLANNode(t, n, "10.0.0.2:38419", nil)
+	attacker := n.Conn(netip.MustParseAddrPort("10.0.0.66:38419"))
+	defer attacker.Close()
+	go func() {
+		buf := make([]byte, MaxLANDatagram)
+		for {
+			k, _, err := attacker.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if captured == nil {
+				captured = append([]byte(nil), buf[:k]...)
+			}
+			mu.Unlock()
+		}
+	}()
+	var heard []string
+	var hmu sync.Mutex
+	a, _ := Open(s, "a", SignalOptions{OnHeard: func(from string, ap netip.AddrPort) {
+		hmu.Lock()
+		heard = append(heard, from+"@"+ap.String())
+		hmu.Unlock()
+	}}, la.Carrier())
+	b, _ := Open(s, "b", SignalOptions{}, lb.Carrier())
+	defer a.Close()
+	defer b.Close()
+	if err := b.Send("", "presence", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "captured", func() bool { mu.Lock(); defer mu.Unlock(); return captured != nil })
+	waitFor(t, "a heard b", func() bool { hmu.Lock(); defer hmu.Unlock(); return len(heard) == 1 })
+	mu.Lock()
+	replay := captured
+	mu.Unlock()
+	for range 3 {
+		_, _ = attacker.WriteTo(replay, net.UDPAddrFromAddrPort(netip.MustParseAddrPort("10.0.0.1:38419")))
+	}
+	time.Sleep(150 * time.Millisecond)
+	hmu.Lock()
+	defer hmu.Unlock()
+	if len(heard) != 1 || heard[0] != "b@10.0.0.2:38419" {
+		t.Fatalf("heard %v", heard)
+	}
+	leg := a.(*signal).legs[0].(*lanLeg)
+	leg.mu.Lock()
+	got := leg.addrs["b"]
+	leg.mu.Unlock()
+	if got != netip.MustParseAddrPort("10.0.0.2:38419") {
+		t.Fatalf("b's address moved to %v", got)
+	}
 }
 
 func TestLANRateAndJunk(t *testing.T) {

@@ -21,7 +21,9 @@ import (
 // where tag = SHA-256("go-room/lan/1" || topic || u64(unix seconds / 300))[:8].
 // The tag picks the room without trying every key, and it changes every five
 // minutes, so a listener can't follow one device from network to network by
-// a fixed value. Receivers accept the current and the previous window.
+// a fixed value. Receivers accept the previous, current and next window, so
+// a sender whose clock is ahead (within the envelope age limit) isn't lost
+// at the end of each window.
 
 // LAN limits and defaults.
 const (
@@ -141,6 +143,25 @@ func (l *LAN) Close() {
 // LocalAddr is the socket's address.
 func (l *LAN) LocalAddr() net.Addr { return l.conn.LocalAddr() }
 
+// Targets is where an envelope for everyone goes right now. Empty means
+// the LAN carrier sends nothing: no private network, or (Windows) every
+// one is on the Public profile.
+func (l *LAN) Targets() []netip.AddrPort { return l.targets() }
+
+// OnPublicNetwork reports whether ip is this machine's address on a
+// network Windows has on the Public firewall profile (always false on
+// other systems), where the LAN carrier stays silent and Windows Firewall
+// blocks what a server listens for.
+func OnPublicNetwork(ip netip.Addr) bool {
+	public := publicInterfaces()
+	for _, s := range LocalSubnets() {
+		if s.Prefix.Addr() == ip.Unmap() {
+			return public[s.Index]
+		}
+	}
+	return false
+}
+
 type lanCarrier struct{ l *LAN }
 
 func (c lanCarrier) Join(topic string, deliver func([]byte, netip.AddrPort), up func()) (Leg, error) {
@@ -175,14 +196,14 @@ func lanTag(topic string, window int64) [lanTagLen]byte {
 
 func (l *LAN) window() int64 { return l.now().Unix() / lanWindow }
 
-// topicsFor returns the open topics a tag names, in the current or the
-// previous window. Called with l.mu held.
+// topicsFor returns the open topics a tag names, in the previous, current
+// or next window. Called with l.mu held.
 func (l *LAN) topicsFor(tag [lanTagLen]byte) []string {
 	w := l.window()
 	if w != l.tagW {
 		l.tags = map[[lanTagLen]byte][]string{}
 		for topic := range l.legs {
-			for _, ww := range []int64{w, w - 1} {
+			for _, ww := range []int64{w, w - 1, w + 1} {
 				t := lanTag(topic, ww)
 				l.tags[t] = append(l.tags[t], topic)
 			}
