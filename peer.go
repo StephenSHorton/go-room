@@ -299,9 +299,9 @@ func (p *Peer) setup() error {
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		switch s {
 		case webrtc.PeerConnectionStateFailed:
-			go p.close(errors.New("room: connection failed"), false, "")
+			p.lost(errors.New("room: connection failed"))
 		case webrtc.PeerConnectionStateClosed:
-			go p.close(errors.New("room: connection closed"), false, "")
+			p.lost(errors.New("room: connection closed"))
 		}
 	})
 	return nil
@@ -368,7 +368,7 @@ func (p *Peer) syncOpen(dc *webrtc.DataChannel) {
 		p.close(err, true, "detach")
 		return
 	}
-	ch := newChannel(raw.(*datachannel.DataChannel), m.cfg.MaxMessage, func(err error) { p.close(err, false, "") })
+	ch := newChannel(raw.(*datachannel.DataChannel), m.cfg.MaxMessage, p.lost)
 	p.mu.Lock()
 	if p.state == stateClosed {
 		p.mu.Unlock()
@@ -467,17 +467,18 @@ func (p *Peer) close(err error, bye bool, reason string) {
 		if p.timer != nil {
 			p.timer.Stop()
 		}
+		if bye {
+			// The token is the peer's own, from its auth (inside DTLS):
+			// only this side can prove the bye is real. It goes before the
+			// teardown so it usually beats the channel's end to the peer.
+			_ = p.m.sig.Send(p.id, MsgBye, byeBody{Session: p.session, Token: p.theirTok, Reason: reason})
+		}
 		shown := p.m.forget(p, wasUp, err)
 		if msgs != nil {
 			msgs.close(err)
 		}
 		for _, s := range streams {
 			s.abort(err)
-		}
-		if bye {
-			// The token is the peer's own, from its auth (inside DTLS):
-			// only this side can prove the bye is real.
-			_ = p.m.sig.Send(p.id, MsgBye, byeBody{Session: p.session, Token: p.theirTok, Reason: reason})
 		}
 		go func() {
 			defer p.m.pcs.Done()
@@ -489,6 +490,25 @@ func (p *Peer) close(err error, bye bool, reason string) {
 			p.m.peerDown(p.id, err)
 		}
 	})
+}
+
+// byeGrace is how long a connection that ended on its own waits for the
+// other side's bye, which travels over signaling and can arrive after the
+// channel's end: with it, Down reports the peer's reason, not a bare close.
+const byeGrace = time.Second
+
+// lost closes p after byeGrace, unless a bye (or anything else) closed it
+// first.
+func (p *Peer) lost(err error) {
+	go func() {
+		t := time.NewTimer(byeGrace)
+		defer t.Stop()
+		select {
+		case <-p.done:
+		case <-t.C:
+		}
+		p.close(err, false, "")
+	}()
 }
 
 func hexs(b []byte) string { return hex.EncodeToString(b) }
