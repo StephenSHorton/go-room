@@ -4,8 +4,8 @@
 // mappings renewed and removes them on Close.
 //
 // Discovery (SSDP for an IGD at the default gateway, then NAT-PMP there)
-// runs only in the app; tests hand Start their own gateways, pointed at fakes on
-// 127.0.0.1.
+// runs only in the app; tests hand Start their own gateways, pointed at
+// fakes on 127.0.0.1.
 package portmap
 
 import (

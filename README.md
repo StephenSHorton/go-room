@@ -47,7 +47,7 @@ Messages and stream writes go out in SCTP messages of at most 16 KiB, because pi
 - **One member:** an envelope for one member is unicast to the address its last authentic envelope came from. Until one is known it is broadcast.
 - IPv4 only.
 
-Each datagram is `"GR1" || tag(8) || nonce(24) || secretbox`, at most 8 KiB. The tag is the first 8 bytes of `SHA-256("go-room/lan/1" || topic || u64(unix seconds / 300))`. A receiver finds the room by it without trying every key, and since it changes every 5 minutes, a listener can't follow one device from network to network by a fixed value. Receivers accept the current and the previous window's tag and drop anything else unopened. They open at most `MaxRate` datagrams a second (default 200), and drop their own broadcasts coming back.
+Each datagram is `"GR1" || tag(8) || nonce(24) || secretbox`, at most 8 KiB. The tag is the first 8 bytes of `SHA-256("go-room/lan/1" || topic || u64(unix seconds / 300))`. A receiver finds the room by it without trying every key, and since it changes every 5 minutes, a listener can't follow one device from network to network by a fixed value. Receivers accept the previous, current and next window's tag and drop anything else unopened. Only the first copy of an envelope that arrives with an address teaches the leg (and `OnHeard`) where its sender is, so a host that resends a captured datagram from its own address can't redirect that member's unicast. They open at most `MaxRate` datagrams a second (default 200), and drop their own broadcasts coming back.
 
 There is no mDNS. Port 5353 belongs to the OS responders, a service record names the service in clear text, and the sealed datagram does discovery and signaling at once.
 
@@ -72,19 +72,20 @@ server = ed25519(device key, "go-room/hub/server/1" || 0x00 || x || len(id) || i
 - **Guests** are devices pairing with only a code. A guest gets the one topic its `hello` names, and only while a member has it open with `guest.open`: at most 10 minutes, and at most 2 per member.
 - **The bridge:** `Bridge` carries open guest topics between the server's LAN and the hub, so a new device at home reaches a member away from home.
 - **Closing:** closing a guest topic drops its guests and revokes their TURN credentials. `Drop(id)` closes a revoked member and its guest topics.
-- **Limits** (`HubLimits`): 64 members, 8 guests, 4 handshakes in flight per IP with a backoff after a failure, 8 topics per connection, 50 `pub` a second. The hub keeps nothing.
+- **Limits** (`HubLimits`): 64 members, 8 guests, 4 handshakes in flight per IP (an IPv6 /64 counts as one) and 64 in all, with a backoff after a failed handshake, 8 topics per connection, 50 `pub` a second. A member's guest topics outlive its last connection by a short grace. The hub keeps nothing.
 
 **TURN.** `NewTURN` runs `pion/turn` on the UDP socket and the TCP side of `SplitTCP`, with relayed sockets on the server's LAN address. Those sockets are never mapped on the router.
-- **Credentials** are the TURN REST scheme: `"<expiry>:<user>"` and `base64(HMAC-SHA1(key, username))`. The 32-byte key never leaves the server. They last 12 hours and are handed out only over the hub (`turn.get`).
+- **Credentials** are the TURN REST scheme: `"<expiry>:<handle>"` and `base64(HMAC-SHA1(key, username))`, where a member's handle is its user masked with a keystream from the key and the expiry, so the username names no stable id. The 32-byte key never leaves the server. They last 12 hours and are handed out only over the hub (`turn.get`).
+- **Integrity first:** pion asks the auth handler before it checks MESSAGE-INTEGRITY, so a client's address is learned only from the `OnAuth` event of a verified request.
 - **Revocation:** `Authorize(user)` runs on every authenticated request, allocation refreshes included, so a revoked device loses its relay at its next refresh.
 - **Peers:** by default, members may relay to the server's own private subnets and to relayed addresses on the server. Guests may relay only to relayed addresses. Neither may relay to loopback, link-local, multicast or the internet.
-- **Caps:** 8 allocations per user, 32 in all.
+- **Caps:** 8 allocations per user, 32 in all, 4 across every guest; a revoked guest's allocations close. TURN over TCP takes 64 connections (8 per IP) and closes one that reads nothing for 5 minutes.
 - There is no `turns:`, because what TURN carries is DTLS already.
 
 **Port mapping** (`go-room/portmap`).
-- **UPnP-IGD** goes through [goupnp](https://github.com/huin/goupnp): WANIPConnection 2, then 1, then WANPPPConnection 1.
+- **UPnP-IGD** goes through [goupnp](https://github.com/huin/goupnp): WANIPConnection 2, then 1, then WANPPPConnection 1. Discovery keeps only an IGD at the default gateway's own address.
 - **NAT-PMP** is go-room's own client, sent to the default gateway from [jackpal/gateway](https://github.com/jackpal/gateway).
-- **Leases** default to 1 h and renew at half of what was granted. A router that grants only permanent leases gets those. `Close` removes the mappings.
+- **Leases** default to 1 h and renew at half of what was granted. A router that grants only permanent leases gets those. `Close` removes the mappings; `Config.Stale` removes what an earlier run left (after a crash) if it still points at this machine. The external address is re-read every 3 minutes.
 - **Conflicts:** a conflict on the external port takes another one.
 - **CGNAT:** `Status` gives the router's external address and says whether it is CGNAT (100.64.0.0/10) or private space. There a mapping succeeds but reaches nobody.
 
