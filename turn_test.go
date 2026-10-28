@@ -353,3 +353,50 @@ func TestRelayFetch(t *testing.T) {
 		t.Fatalf("fetched %d times", calls.Load())
 	}
 }
+
+// Two meshes forced to relay-only ICE connect through the TURN server, over
+// UDP and over TCP through SplitTCP, all on 127.0.0.1.
+func TestMeshRelayOnlyThroughTURN(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubLn, turnLn := SplitTCP(ln)
+	defer hubLn.Close()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := TURNConfig{UDP: pc, TCP: turnLn, RelayIP: netip.MustParseAddr("127.0.0.1"),
+		AllowPeer: func(string, netip.Addr) bool { return true }} // loopback, for the test
+	_, _ = rand.Read(cfg.Key[:])
+	srv, err := NewTURN(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	for _, tc := range []struct{ name, url string }{
+		{"udp", "turn:" + pc.LocalAddr().String() + "?transport=udp"},
+		{"tcp", "turn:" + ln.Addr().String() + "?transport=tcp"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := NewMemHub()
+			s := testSecret(t)
+			ice := func(user string) func() []ICEServer {
+				return func() []ICEServer {
+					c := srv.Issue(user)
+					return []ICEServer{{URLs: []string{tc.url}, Username: c.Username, Credential: c.Credential}}
+				}
+			}
+			a := newNode(t, hub, s, "dev-a", nodeOpts{ice: ice("dev-a"), relay: true})
+			b := newNode(t, hub, s, "dev-b", nodeOpts{ice: ice("dev-b"), relay: true})
+			pa, pb := pair(t, a, b)
+			if pa.Path() != "relay" || pb.Path() != "relay" {
+				t.Fatalf("paths %q %q", pa.Path(), pb.Path())
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			exchange(t, ctx, pa, pb)
+		})
+	}
+}

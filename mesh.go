@@ -84,6 +84,10 @@ type Config struct {
 	// Tune adjusts the pion SettingEngine after go-room's own settings
 	// (tests: LoopbackOnly()).
 	Tune func(*webrtc.SettingEngine)
+	// RelayOnly makes every connection go through a TURN relay from ICE
+	// (ICE transport policy "relay"): tests that prove a relayed path, or
+	// an app that must not reveal its addresses to peers.
+	RelayOnly bool
 	// MaxMessage caps one Channel message, both ways (default 4 MiB).
 	MaxMessage int
 	// MaxStreams caps the streams this side opens to one peer at a time

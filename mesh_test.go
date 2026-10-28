@@ -29,6 +29,8 @@ type nodeOpts struct {
 	sign    func([]byte) []byte // override (a forger)
 	streams int
 	allow   func(peer string) bool
+	ice     func() []ICEServer // default: none
+	relay   bool               // RelayOnly
 }
 
 // newNode opens a member on hub that connects over 127.0.0.1 only: no STUN,
@@ -53,12 +55,17 @@ func newNodeOn(t *testing.T, sig Signaler, id string, o nodeOpts) *node {
 	if accept == nil {
 		accept = func(string, ed25519.PublicKey) error { return nil }
 	}
+	ice := o.ice
+	if ice == nil {
+		ice = func() []ICEServer { return nil }
+	}
 	m, err := NewMesh(n.sig, Config{
 		Self:       id,
 		Identity:   ident,
 		Accept:     accept,
 		Allow:      o.allow,
-		ICE:        func() []ICEServer { return nil },
+		ICE:        ice,
+		RelayOnly:  o.relay,
 		Tune:       LoopbackOnly(),
 		MaxMessage: 8 << 20,
 		MaxStreams: o.streams,

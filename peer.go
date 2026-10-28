@@ -258,7 +258,11 @@ func (p *Peer) setup() error {
 	if m.cfg.ICE != nil {
 		servers = m.cfg.ICE()
 	}
-	pc, err := m.api.NewPeerConnection(webrtc.Configuration{ICEServers: WebRTCServers(servers)})
+	conf := webrtc.Configuration{ICEServers: WebRTCServers(servers)}
+	if m.cfg.RelayOnly {
+		conf.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
+	pc, err := m.api.NewPeerConnection(conf)
 	if err != nil {
 		return err
 	}
