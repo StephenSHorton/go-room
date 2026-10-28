@@ -3,6 +3,7 @@ package room
 import (
 	"crypto/hmac"
 	"crypto/sha1" //nolint:gosec // TURN REST credentials are HMAC-SHA1 by definition
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -21,24 +22,39 @@ import (
 // home. Credentials are the TURN REST scheme, minted by the app (over its
 // hub) and never fetched over HTTP:
 //
-//	username   = "<expiry unix seconds>:<user>"
+//	username   = "<expiry unix seconds>:<handle>"
 //	credential = base64(HMAC-SHA1(key, username))
 //
-// The key never leaves the server. Every authenticated request, allocation
-// refreshes included, asks the app's Authorize again, so a revoked device
-// loses its relay at its next refresh rather than at expiry.
+// A member's handle is "~" and its user (a device id) masked with a
+// keystream from the key and the expiry, so the USERNAME that crosses every
+// network a device roams in names no stable id; a guest's is its random
+// "guest-" user. The key never leaves the server. Every authenticated
+// request, allocation refreshes included, asks the app's Authorize again, so
+// a revoked device loses its relay at its next refresh rather than at
+// expiry.
 
 // TURN defaults.
 const (
-	DefaultTURNTTL     = 12 * time.Hour
-	DefaultTURNRealm   = "relay"
-	DefaultMaxPerUser  = 8
-	DefaultMaxTotal    = 32
-	turnAllocLifetime  = 10 * time.Minute
-	guestUserPrefix    = "guest-"
-	turnSrcCap         = 4096 // remembered client addresses (for the peer filter)
-	turnSrcForgetAfter = time.Hour
+	DefaultTURNTTL      = 12 * time.Hour
+	DefaultTURNRealm    = "relay"
+	DefaultMaxPerUser   = 8
+	DefaultMaxTotal     = 32
+	DefaultMaxGuests    = 4  // allocations across every guest
+	DefaultMaxTCP       = 64 // TURN-over-TCP connections
+	DefaultMaxTCPPerIP  = 8
+	turnAllocLifetime   = 10 * time.Minute
+	guestUserPrefix     = "guest-"
+	memberHandlePrefix  = "~"
+	turnSrcCap          = 4096 // remembered client addresses (for the peer filter)
+	turnSrcForgetAfter  = time.Hour
+	turnRefusedLogEvery = 10 * time.Second
 )
+
+// turnTCPIdle closes a TURN-over-TCP connection that sends nothing for this
+// long. Clients refresh permissions every few minutes and ChannelData flows
+// while a path is in use, so only a silent connection hits it. A variable
+// so tests can run fast.
+var turnTCPIdle = 5 * time.Minute
 
 var (
 	errTURNTCPRelay    = errors.New("room: tcp relay allocations are not supported")
@@ -73,8 +89,13 @@ type TURNConfig struct {
 	// relayed addresses. Loopback, link-local, multicast and public
 	// addresses are never in the default.
 	AllowPeer func(user string, ip netip.Addr) bool
-	// MaxPerUser and MaxTotal cap allocations (defaults 8 and 32).
-	MaxPerUser, MaxTotal int
+	// MaxPerUser and MaxTotal cap allocations (defaults 8 and 32);
+	// MaxGuests caps the allocations of every guest together (default 4),
+	// so pairing guests never take the relay from members.
+	MaxPerUser, MaxTotal, MaxGuests int
+	// MaxTCP and MaxTCPPerIP cap TURN-over-TCP connections (defaults 64
+	// and 8; an IPv6 /64 counts as one IP).
+	MaxTCP, MaxTCPPerIP int
 	// Logf, when set, gets diagnostics (never credentials).
 	Logf func(format string, args ...any)
 }
@@ -87,12 +108,16 @@ type TURNServer struct {
 	udpPort uint16
 	now     func() time.Time
 
-	mu     sync.Mutex
-	guests map[string]time.Time // guest user -> credentials valid until
-	srcs   map[string]srcUser   // client transport address -> user
-	users  map[string]int       // allocations per user
-	total  int
-	relays map[uint16]bool // relayed ports in use
+	mu         sync.Mutex
+	guests     map[string]time.Time // guest user -> credentials valid until
+	srcs       map[string]srcUser   // client transport address -> user, after a verified request
+	users      map[string]int       // allocations per user
+	total      int
+	guestTotal int
+	relays     map[uint16]bool                        // relayed ports in use
+	conns      map[string]map[*turnRelayConn]struct{} // allocations per guest user
+	refusedAt  time.Time                              // last "refused" log line
+	refusedN   int                                    // refusals not logged since
 }
 
 type srcUser struct {
@@ -123,6 +148,15 @@ func NewTURN(cfg TURNConfig) (*TURNServer, error) {
 	if cfg.MaxTotal <= 0 {
 		cfg.MaxTotal = DefaultMaxTotal
 	}
+	if cfg.MaxGuests <= 0 {
+		cfg.MaxGuests = DefaultMaxGuests
+	}
+	if cfg.MaxTCP <= 0 {
+		cfg.MaxTCP = DefaultMaxTCP
+	}
+	if cfg.MaxTCPPerIP <= 0 {
+		cfg.MaxTCPPerIP = DefaultMaxTCPPerIP
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
@@ -133,6 +167,7 @@ func NewTURN(cfg TURNConfig) (*TURNServer, error) {
 		srcs:   map[string]srcUser{},
 		users:  map[string]int{},
 		relays: map[uint16]bool{},
+		conns:  map[string]map[*turnRelayConn]struct{}{},
 	}
 	for _, s := range LocalSubnets() {
 		t.subnets = append(t.subnets, s.Prefix.Masked())
@@ -151,12 +186,16 @@ func NewTURN(cfg TURNConfig) (*TURNServer, error) {
 		AuthHandler:        t.auth,
 		LoggerFactory:      lf,
 		AllocationLifetime: turnAllocLifetime,
+		// pion asks AuthHandler before it checks MESSAGE-INTEGRITY, so a
+		// client's address is learned only here, once the check passed.
+		EventHandler: turn.EventHandler{OnAuth: t.onAuth, OnAllocationDeleted: t.onAllocDeleted},
 	}
 	if cfg.UDP != nil {
 		sc.PacketConnConfigs = []turn.PacketConnConfig{{PacketConn: cfg.UDP, RelayAddressGenerator: gen, PermissionHandler: t.permit}}
 	}
 	if cfg.TCP != nil {
-		sc.ListenerConfigs = []turn.ListenerConfig{{Listener: cfg.TCP, RelayAddressGenerator: gen, PermissionHandler: t.permit}}
+		ln := &turnTCPListener{Listener: cfg.TCP, max: cfg.MaxTCP, perIP: cfg.MaxTCPPerIP, byIP: map[netip.Addr]int{}}
+		sc.ListenerConfigs = []turn.ListenerConfig{{Listener: ln, RelayAddressGenerator: gen, PermissionHandler: t.permit}}
 	}
 	srv, err := turn.NewServer(sc)
 	if err != nil {
@@ -197,16 +236,80 @@ func (t *TURNServer) IssueGuest(until time.Time) TURNCreds {
 	return t.mint(user, until)
 }
 
-// revokeGuest ends a guest's credentials early (its pairing window closed).
+// revokeGuest ends a guest's credentials early (its pairing window closed)
+// and closes the allocations it made, so they don't hold the guest pool
+// until their next refresh.
 func (t *TURNServer) revokeGuest(user string) {
 	t.mu.Lock()
 	delete(t.guests, user)
+	var conns []*turnRelayConn
+	for c := range t.conns[user] {
+		conns = append(conns, c)
+	}
 	t.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }
 
 func (t *TURNServer) mint(user string, until time.Time) TURNCreds {
-	name := strconv.FormatInt(until.Unix(), 10) + ":" + user
+	exp := strconv.FormatInt(until.Unix(), 10)
+	name := exp + ":" + t.handle(user, exp)
 	return TURNCreds{Username: name, Credential: t.credential(name), TTL: until.Sub(t.now()).Truncate(time.Second)}
+}
+
+// handle is the username's part after the expiry: a guest's random user as
+// it is, a member's masked (see the top of this file).
+func (t *TURNServer) handle(user, exp string) string {
+	if strings.HasPrefix(user, guestUserPrefix) {
+		return user
+	}
+	b := []byte(user)
+	for i, m := range t.mask(exp, len(b)) {
+		b[i] ^= m
+	}
+	return memberHandlePrefix + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// mask is n bytes of HMAC-SHA256(key, label || exp || counter) keystream.
+func (t *TURNServer) mask(exp string, n int) []byte {
+	var out []byte
+	for i := 0; len(out) < n; i++ {
+		mac := hmac.New(sha256.New, t.cfg.Key[:])
+		mac.Write([]byte("go-room/turn/user/1\x00"))
+		mac.Write([]byte(exp))
+		mac.Write([]byte{0, byte(i)})
+		out = mac.Sum(out)
+	}
+	return out[:n]
+}
+
+// parseUsername reads "<expiry>:<handle>" back into the expiry and user.
+// It checks nothing but the shape: the credential check comes after.
+func (t *TURNServer) parseUsername(username string) (int64, string, bool) {
+	exp, h, ok := strings.Cut(username, ":")
+	if !ok || h == "" {
+		return 0, "", false
+	}
+	e, err := strconv.ParseInt(exp, 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	if strings.HasPrefix(h, guestUserPrefix) {
+		return e, h, true
+	}
+	masked, ok := strings.CutPrefix(h, memberHandlePrefix)
+	if !ok {
+		return 0, "", false
+	}
+	b, err := base64.RawURLEncoding.DecodeString(masked)
+	if err != nil || len(b) == 0 || len(b) > 255 {
+		return 0, "", false
+	}
+	for i, m := range t.mask(exp, len(b)) {
+		b[i] ^= m
+	}
+	return e, string(b), true
 }
 
 func (t *TURNServer) credential(username string) string {
@@ -216,14 +319,12 @@ func (t *TURNServer) credential(username string) string {
 }
 
 // auth is pion's AuthHandler: the REST credential check, then the app's
-// Authorize (or the guest list), on every authenticated request.
+// Authorize (or the guest list), on every authenticated request. pion
+// checks MESSAGE-INTEGRITY only after this returns, so nothing here may
+// record anything about the client: onAuth does, once the check passed.
 func (t *TURNServer) auth(ra *turn.RequestAttributes) (string, []byte, bool) {
-	exp, user, ok := strings.Cut(ra.Username, ":")
-	if !ok || user == "" {
-		return "", nil, false
-	}
-	e, err := strconv.ParseInt(exp, 10, 64)
-	if err != nil || e < t.now().Unix() {
+	e, user, ok := t.parseUsername(ra.Username)
+	if !ok || e < t.now().Unix() {
 		return "", nil, false
 	}
 	if strings.HasPrefix(user, guestUserPrefix) {
@@ -235,14 +336,51 @@ func (t *TURNServer) auth(ra *turn.RequestAttributes) (string, []byte, bool) {
 		}
 	} else if t.cfg.Authorize != nil {
 		if err := t.cfg.Authorize(user); err != nil {
-			t.cfg.Logf("turn: refused %s: %v", user, err)
+			t.logRefused(user, err)
 			return "", nil, false
 		}
 	}
-	if ra.SrcAddr != nil {
-		t.rememberSrc(ra.SrcAddr.String(), user)
-	}
 	return user, turn.GenerateAuthKey(ra.Username, ra.Realm, t.credential(ra.Username)), true
+}
+
+// logRefused logs a refused user at most once per turnRefusedLogEvery, so
+// a flood of requests can't fill the log.
+func (t *TURNServer) logRefused(user string, err error) {
+	t.mu.Lock()
+	now := t.now()
+	if now.Sub(t.refusedAt) < turnRefusedLogEvery {
+		t.refusedN++
+		t.mu.Unlock()
+		return
+	}
+	n := t.refusedN
+	t.refusedAt, t.refusedN = now, 0
+	t.mu.Unlock()
+	if n > 0 {
+		t.cfg.Logf("turn: refused %q: %v (and %d more refusals)", user, err, n)
+		return
+	}
+	t.cfg.Logf("turn: refused %q: %v", user, err)
+}
+
+// onAuth is pion's OnAuth event, after MESSAGE-INTEGRITY: a verified
+// request is what teaches permit which user an address belongs to.
+func (t *TURNServer) onAuth(src, _ net.Addr, _, username, _, _ string, verdict bool) {
+	if !verdict || src == nil {
+		return
+	}
+	if _, user, ok := t.parseUsername(username); ok {
+		t.rememberSrc(src.String(), user)
+	}
+}
+
+func (t *TURNServer) onAllocDeleted(src, _ net.Addr, _, _, _ string) {
+	if src == nil {
+		return
+	}
+	t.mu.Lock()
+	delete(t.srcs, src.String())
+	t.mu.Unlock()
 }
 
 func (t *TURNServer) rememberSrc(src, user string) {
@@ -319,9 +457,13 @@ func (g *turnRelayGen) AllocatePacketConn(conf turn.AllocateListenerConfig) (net
 		return nil, nil, errTURNNotIPv4
 	}
 	t := g.t
+	guest := strings.HasPrefix(conf.UserID, guestUserPrefix)
 	t.mu.Lock()
 	switch {
 	case t.total >= t.cfg.MaxTotal:
+		t.mu.Unlock()
+		return nil, nil, errTURNServerQuota
+	case guest && t.guestTotal >= t.cfg.MaxGuests:
 		t.mu.Unlock()
 		return nil, nil, errTURNServerQuota
 	case t.users[conf.UserID] >= t.cfg.MaxPerUser:
@@ -330,17 +472,33 @@ func (g *turnRelayGen) AllocatePacketConn(conf turn.AllocateListenerConfig) (net
 	}
 	t.users[conf.UserID]++
 	t.total++
+	if guest {
+		t.guestTotal++
+	}
 	t.mu.Unlock()
 	conn, addr, err := g.inner.AllocatePacketConn(conf)
 	if err != nil {
-		t.release(conf.UserID, 0)
+		t.release(conf.UserID, 0, nil)
 		return nil, nil, err
 	}
 	port := addrPortOf(conn.LocalAddr()).Port()
+	rc := &turnRelayConn{PacketConn: conn, t: t, user: conf.UserID, port: port}
 	t.mu.Lock()
 	t.relays[port] = true
+	_, live := t.guests[conf.UserID]
+	if guest && live {
+		if t.conns[conf.UserID] == nil {
+			t.conns[conf.UserID] = map[*turnRelayConn]struct{}{}
+		}
+		t.conns[conf.UserID][rc] = struct{}{}
+	}
 	t.mu.Unlock()
-	return &turnRelayConn{PacketConn: conn, t: t, user: conf.UserID, port: port}, addr, nil
+	if guest && !live {
+		// Revoked while this allocation was being made.
+		_ = rc.Close()
+		return nil, nil, errTURNServerQuota
+	}
+	return rc, addr, nil
 }
 
 func (g *turnRelayGen) AllocateListener(turn.AllocateListenerConfig) (net.Listener, net.Addr, error) {
@@ -351,15 +509,24 @@ func (g *turnRelayGen) AllocateConn(turn.AllocateConnConfig) (net.Conn, error) {
 	return nil, errTURNTCPRelay
 }
 
-func (t *TURNServer) release(user string, port uint16) {
+func (t *TURNServer) release(user string, port uint16, c *turnRelayConn) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.users[user]--; t.users[user] <= 0 {
 		delete(t.users, user)
 	}
 	t.total--
+	if strings.HasPrefix(user, guestUserPrefix) {
+		t.guestTotal--
+	}
 	if port != 0 {
 		delete(t.relays, port)
+	}
+	if set := t.conns[user]; set != nil && c != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(t.conns, user)
+		}
 	}
 }
 
@@ -386,6 +553,71 @@ func (c *turnRelayConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 }
 
 func (c *turnRelayConn) Close() error {
-	c.once.Do(func() { c.t.release(c.user, c.port) })
-	return c.PacketConn.Close()
+	err := net.ErrClosed
+	c.once.Do(func() {
+		c.t.release(c.user, c.port, c)
+		err = c.PacketConn.Close()
+	})
+	return err
+}
+
+// turnTCPListener is the TURN side of port N as pion sees it: it caps the
+// connections open (in total and per IP), and each connection closes after
+// turnTCPIdle with nothing read, so one host can't hold sockets, goroutines
+// and buffers on the server by sending a STUN-looking byte and going quiet.
+type turnTCPListener struct {
+	net.Listener
+	max, perIP int
+
+	mu   sync.Mutex
+	n    int
+	byIP map[netip.Addr]int
+}
+
+func (l *turnTCPListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		ip := limitKey(remoteAddr(c).Addr())
+		l.mu.Lock()
+		ok := l.n < l.max && l.byIP[ip] < l.perIP
+		if ok {
+			l.n++
+			l.byIP[ip]++
+		}
+		l.mu.Unlock()
+		if !ok {
+			_ = c.Close()
+			continue
+		}
+		return &idleConn{Conn: c, done: func() { l.done(ip) }}, nil
+	}
+}
+
+func (l *turnTCPListener) done(ip netip.Addr) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.n--
+	if l.byIP[ip]--; l.byIP[ip] <= 0 {
+		delete(l.byIP, ip)
+	}
+}
+
+// idleConn pushes its read deadline turnTCPIdle ahead before every read.
+type idleConn struct {
+	net.Conn
+	done func()
+	once sync.Once
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(turnTCPIdle))
+	return c.Conn.Read(p)
+}
+
+func (c *idleConn) Close() error {
+	c.once.Do(c.done)
+	return c.Conn.Close()
 }

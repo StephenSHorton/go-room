@@ -104,8 +104,15 @@ func TestTURNRelaysBetweenMembers(t *testing.T) {
 		}
 	})
 	ca := srv.Issue("dev-a")
-	if !strings.HasSuffix(ca.Username, ":dev-a") || ca.TTL < DefaultTURNTTL-time.Minute {
+	// The username names no stable id, and a later credential's differs.
+	if strings.Contains(ca.Username, "dev-a") || ca.TTL < DefaultTURNTTL-time.Minute {
 		t.Fatalf("creds %q ttl %v", ca.Username, ca.TTL)
+	}
+	if _, user, ok := srv.parseUsername(ca.Username); !ok || user != "dev-a" {
+		t.Fatalf("parse %q = %q %v", ca.Username, user, ok)
+	}
+	if later := srv.mint("dev-a", time.Now().Add(time.Hour)); later.Username == ca.Username {
+		t.Fatal("two expiries, one username")
 	}
 	ra, err := allocate(t, addr, ca)
 	if err != nil {
@@ -188,6 +195,119 @@ func TestTURNGuestAndCaps(t *testing.T) {
 	fake := srv.mint(guestUserPrefix+"nobody", time.Now().Add(time.Minute))
 	if _, err := allocate(t, addr, fake); err == nil {
 		t.Fatal("unissued guest allocated")
+	}
+}
+
+// A request with a real username but no valid MESSAGE-INTEGRITY teaches
+// the server nothing about its source address.
+func TestTURNLearnsSourcesOnlyAfterIntegrity(t *testing.T) {
+	srv, addr := newTestTURN(t, nil)
+	good := srv.Issue("dev-a")
+	for range 3 {
+		bad := good
+		bad.Credential = "not-the-credential"
+		if _, err := allocate(t, addr, bad); err == nil {
+			t.Fatal("bad integrity allocated")
+		}
+	}
+	srv.mu.Lock()
+	n := len(srv.srcs)
+	srv.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d sources remembered from failed requests", n)
+	}
+	if _, err := allocate(t, addr, good); err != nil {
+		t.Fatal(err)
+	}
+	srv.mu.Lock()
+	n = len(srv.srcs)
+	srv.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d sources after one verified client", n)
+	}
+}
+
+// Guests share a small pool, and a revoked guest's allocations close.
+func TestTURNGuestPool(t *testing.T) {
+	srv, addr := newTestTURN(t, func(c *TURNConfig) { c.MaxGuests = 2 })
+	g1 := srv.IssueGuest(time.Now().Add(5 * time.Minute))
+	g2 := srv.IssueGuest(time.Now().Add(5 * time.Minute))
+	if _, err := allocate(t, addr, g1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := allocate(t, addr, g2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := allocate(t, addr, srv.IssueGuest(time.Now().Add(5*time.Minute))); err == nil {
+		t.Fatal("a third guest allocation past MaxGuests")
+	}
+	if _, err := allocate(t, addr, srv.Issue("dev-a")); err != nil {
+		t.Fatalf("a member was refused while guests hold their pool: %v", err)
+	}
+	_, gu, _ := strings.Cut(g1.Username, ":")
+	srv.revokeGuest(gu)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := srv.guestTotal
+		srv.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("guest allocations after a revoke: %d", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TURN over TCP caps connections per IP and drops ones that go quiet.
+func TestTURNTCPCapsAndIdle(t *testing.T) {
+	old := turnTCPIdle
+	turnTCPIdle = 200 * time.Millisecond
+	t.Cleanup(func() { turnTCPIdle = old })
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := TURNConfig{UDP: pc, TCP: ln, RelayIP: netip.MustParseAddr("127.0.0.1"), MaxTCPPerIP: 2}
+	_, _ = rand.Read(cfg.Key[:])
+	srv, err := NewTURN(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	dial := func() net.Conn {
+		c, err := net.Dial("tcp4", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		_, _ = c.Write([]byte{0x00})
+		return c
+	}
+	closed := func(c net.Conn, within time.Duration) bool {
+		_ = c.SetReadDeadline(time.Now().Add(within))
+		_, err := c.Read(make([]byte, 1))
+		var ne net.Error
+		return err != nil && !(errors.As(err, &ne) && ne.Timeout())
+	}
+	a, b := dial(), dial()
+	time.Sleep(50 * time.Millisecond)
+	if c := dial(); !closed(c, time.Second) {
+		t.Fatal("a third connection from one IP stayed open")
+	}
+	if !closed(a, 2*time.Second) || !closed(b, 2*time.Second) {
+		t.Fatal("silent connections stayed open past the idle timeout")
+	}
+	// Their slots are free again.
+	time.Sleep(50 * time.Millisecond)
+	if c := dial(); closed(c, 100*time.Millisecond) {
+		t.Fatal("a new connection was refused after the others closed")
 	}
 }
 

@@ -2,6 +2,7 @@ package room
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -24,12 +25,21 @@ func SplitTCP(ln net.Listener) (hub, turn net.Listener) {
 // byte.
 var splitPeekTimeout = 5 * time.Second
 
+// Connections still waiting for their first byte, in total and per IP (an
+// IPv6 /64 counts as one); past either, a new connection is closed at once.
+const (
+	splitMaxPending      = 64
+	splitMaxPendingPerIP = 8
+)
+
 type splitter struct {
 	ln        net.Listener
 	hub, turn *splitSide
 	gone      chan struct{} // closed when ln stops accepting
 	mu        sync.Mutex
 	closed    int // sides closed
+	pending   int
+	byIP      map[netip.Addr]int
 }
 
 func (s *splitter) accept() {
@@ -42,10 +52,56 @@ func (s *splitter) accept() {
 			}
 			return
 		}
-		go s.route(c)
+		ip := limitKey(remoteAddr(c).Addr())
+		if !s.hold(ip) {
+			_ = c.Close()
+			continue
+		}
+		go func() {
+			defer s.release(ip)
+			s.route(c)
+		}()
 	}
 }
 
+func (s *splitter) hold(ip netip.Addr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byIP == nil {
+		s.byIP = map[netip.Addr]int{}
+	}
+	if s.pending >= splitMaxPending || s.byIP[ip] >= splitMaxPendingPerIP {
+		return false
+	}
+	s.pending++
+	s.byIP[ip]++
+	return true
+}
+
+func (s *splitter) release(ip netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pending--
+	if s.byIP[ip]--; s.byIP[ip] <= 0 {
+		delete(s.byIP, ip)
+	}
+}
+
+// limitKey is the key per-IP limits count under: the address for IPv4, its
+// /64 for IPv6, since one host can hold a whole /64.
+func limitKey(ip netip.Addr) netip.Addr {
+	ip = ip.Unmap()
+	if ip.Is6() {
+		if p, err := ip.Prefix(64); err == nil {
+			return p.Addr()
+		}
+	}
+	return ip
+}
+
+// route reads the first byte and hands the connection to its side. It
+// returns once the side took it (or it was closed), so the pending count
+// covers the whole wait.
 func (s *splitter) route(c net.Conn) {
 	_ = c.SetReadDeadline(time.Now().Add(splitPeekTimeout))
 	var b [1]byte
