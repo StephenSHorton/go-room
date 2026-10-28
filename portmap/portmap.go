@@ -3,8 +3,8 @@
 // client), so devices away from home can reach a home server. It keeps the
 // mappings renewed and removes them on Close.
 //
-// Discovery (SSDP for IGDs, the default gateway for NAT-PMP) runs only in
-// the app; tests hand Start their own gateways, pointed at fakes on
+// Discovery (SSDP for an IGD at the default gateway, then NAT-PMP there)
+// runs only in the app; tests hand Start their own gateways, pointed at fakes on
 // 127.0.0.1.
 package portmap
 
@@ -40,6 +40,13 @@ type Gateway interface {
 	Unmap(ctx context.Context, p Port) error
 }
 
+// staleUnmapper is a Gateway that can remove a mapping an earlier run of
+// this app left, after checking it is this machine's own (UPnP; NAT-PMP
+// mappings always expire).
+type staleUnmapper interface {
+	UnmapStale(ctx context.Context, p Port) error
+}
+
 // ErrConflict is Map's error when the external port is taken by another
 // mapping; the Mapper then asks for another one.
 var ErrConflict = errors.New("portmap: external port already mapped")
@@ -71,13 +78,20 @@ func (s Status) equal(o Status) bool {
 type Config struct {
 	// Ports to map (Irori: TCP N and UDP N).
 	Ports []Port
-	// Discover finds gateways, tried in order. nil: SSDP for IGDs, then
-	// NAT-PMP at the default gateway.
+	// Discover finds gateways, tried in order. nil: SSDP for an IGD at the
+	// default gateway (an answer from any other host is ignored), then
+	// NAT-PMP there.
 	Discover func(ctx context.Context) ([]Gateway, error)
 	// Lifetime asked for (default 1 h); renewed at half of what was granted.
 	Lifetime time.Duration
 	// Description is the UPnP mapping description (Irori: "irori").
 	Description string
+	// Stale lists mappings an earlier run may have left on the router
+	// (Proto and External): a crash, a kill or a power cut skips Close, and
+	// a permanent UPnP lease then stays forever. Each is removed from the
+	// first gateway mapped on, if it still points at this machine with
+	// this Description.
+	Stale []Port
 	// OnChange, when set, gets each new Status.
 	OnChange func(Status)
 	// Logf, when set, gets diagnostics.
@@ -87,7 +101,8 @@ type Config struct {
 // Timing, as variables so tests can run fast.
 var (
 	retryFailed = 5 * time.Minute  // after nothing could be mapped
-	recheck     = 30 * time.Minute // a permanent mapping's external address is re-read this often
+	recheck     = 30 * time.Minute // a permanent mapping is asked for again this often
+	ipPoll      = 3 * time.Minute  // the router's external address is re-read this often
 	minRenew    = time.Second
 	callTimeout = 10 * time.Second
 	conflictTry = 4 // other external ports tried after a conflict
@@ -106,10 +121,11 @@ type Mapper struct {
 	quit chan struct{}
 	done chan struct{}
 
-	mu     sync.Mutex
-	status Status
-	gw     Gateway
-	mapped []Port
+	mu        sync.Mutex
+	status    Status
+	gw        Gateway
+	mapped    []Port
+	staleDone bool
 }
 
 // Start begins mapping in the background.
@@ -177,12 +193,78 @@ func (m *Mapper) loop() {
 	defer m.unmapAll()
 	m.set(Status{State: StatePending})
 	for {
-		wait := m.cycle()
-		select {
-		case <-m.quit:
-			return
-		case <-time.After(wait):
+		next := time.Now().Add(m.cycle())
+		// Between renewals, the external address is re-read: an ISP can
+		// change it at any time, and devices away from home dial it.
+		for {
+			d := time.Until(next)
+			if d <= 0 {
+				break
+			}
+			select {
+			case <-m.quit:
+				return
+			case <-time.After(min(d, ipPoll)):
+			}
+			if time.Until(next) > 0 {
+				m.recheckIP()
+			}
 		}
+	}
+}
+
+// recheckIP re-reads the external address on the gateway in use and
+// updates the status when it changed.
+func (m *Mapper) recheckIP() {
+	m.mu.Lock()
+	g, st := m.gw, m.status
+	m.mu.Unlock()
+	if g == nil || st.State != StateOK {
+		return
+	}
+	ctx, cancel := m.ctx()
+	ext, err := g.ExternalIP(ctx)
+	cancel()
+	if err != nil || ext.Unmap() == st.External {
+		return
+	}
+	m.cfg.Logf("portmap: the router's external address changed to %s", ext.Unmap())
+	m.mu.Lock()
+	if m.gw != g {
+		m.mu.Unlock()
+		return
+	}
+	st = m.status
+	st.External = ext.Unmap()
+	st.CGNAT = CGNAT(st.External)
+	st.Ports = slices.Clone(st.Ports)
+	m.mu.Unlock()
+	m.set(st)
+}
+
+// unmapStale removes Config.Stale from the first gateway that can, once
+// per Mapper.
+func (m *Mapper) unmapStale(g Gateway) {
+	su, ok := g.(staleUnmapper)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	done := m.staleDone
+	m.staleDone = true
+	m.mu.Unlock()
+	if done {
+		return
+	}
+	for _, p := range m.cfg.Stale {
+		if p.External == 0 {
+			continue
+		}
+		ctx, cancel := m.ctx()
+		if err := su.UnmapStale(ctx, p); err != nil {
+			m.cfg.Logf("portmap: remove an old %s %d: %v", p.Proto, p.External, err)
+		}
+		cancel()
 	}
 }
 
@@ -231,6 +313,9 @@ func (m *Mapper) mapOn(g Gateway, renew bool) (time.Duration, error) {
 		m.mu.Lock()
 		want = slices.Clone(m.mapped)
 		m.mu.Unlock()
+	}
+	if !renew {
+		m.unmapStale(g)
 	}
 	var got []Port
 	shortest := time.Duration(0)

@@ -12,7 +12,9 @@ import (
 
 	"github.com/huin/goupnp"
 	"github.com/huin/goupnp/dcps/internetgateway2"
+	"github.com/huin/goupnp/httpu"
 	"github.com/huin/goupnp/soap"
+	"github.com/huin/goupnp/ssdp"
 )
 
 // UPnP error codes (IGD v1 and v2 WANIPConnection).
@@ -28,6 +30,8 @@ type igdClient interface {
 	AddPortMappingCtx(ctx context.Context, remoteHost string, extPort uint16, proto string, intPort uint16,
 		intClient string, enabled bool, desc string, lease uint32) error
 	DeletePortMappingCtx(ctx context.Context, remoteHost string, extPort uint16, proto string) error
+	GetSpecificPortMappingEntryCtx(ctx context.Context, remoteHost string, extPort uint16, proto string) (
+		intPort uint16, intClient string, enabled bool, desc string, lease uint32, err error)
 }
 
 type upnpGateway struct {
@@ -71,6 +75,20 @@ func (g *upnpGateway) Map(ctx context.Context, p Port, life time.Duration) (Port
 }
 
 func (g *upnpGateway) Unmap(ctx context.Context, p Port) error {
+	return g.c.DeletePortMappingCtx(ctx, "", p.External, upnpProto(p.Proto))
+}
+
+// UnmapStale removes a mapping an earlier run left (a crash leaves a
+// permanent one forever), only if the router says it points at this
+// machine and carries this app's description.
+func (g *upnpGateway) UnmapStale(ctx context.Context, p Port) error {
+	_, client, _, desc, _, err := g.c.GetSpecificPortMappingEntryCtx(ctx, "", p.External, upnpProto(p.Proto))
+	if err != nil {
+		return err
+	}
+	if client != g.local || desc != g.desc {
+		return nil // someone else's
+	}
 	return g.c.DeletePortMappingCtx(ctx, "", p.External, upnpProto(p.Proto))
 }
 
@@ -152,28 +170,55 @@ func addrOf(a net.Addr) netip.Addr {
 }
 
 // discoverUPnP finds IGDs on the network by SSDP (a multicast search: the
-// app only, never tests).
-func discoverUPnP(ctx context.Context, desc string) []Gateway {
+// app only, never tests), sent from the interface that reaches gw, the
+// default gateway. Only an IGD at gw itself is kept, and only its
+// description is fetched: any host on the LAN can answer SSDP, and one that
+// isn't the router could otherwise take the mapping and name any address
+// as the "external" one, or make this machine fetch any URL.
+func discoverUPnP(ctx context.Context, desc string, gw netip.Addr) []Gateway {
+	if !gw.IsValid() {
+		return nil
+	}
+	local, err := localAddrFor(&url.URL{Host: net.JoinHostPort(gw.String(), "1900")})
+	if err != nil {
+		return nil
+	}
+	hc, err := httpu.NewHTTPUClientAddr(local)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = hc.Close() }()
 	var out []Gateway
 	seen := map[string]bool{}
 	for _, st := range []string{"urn:schemas-upnp-org:device:InternetGatewayDevice:2", "urn:schemas-upnp-org:device:InternetGatewayDevice:1"} {
-		found, err := goupnp.DiscoverDevicesCtx(ctx, st)
+		sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		resps, err := ssdp.RawSearch(sctx, hc, st, 3)
+		cancel()
 		if err != nil {
 			continue
 		}
-		for _, d := range found {
-			if d.Err != nil || d.Root == nil || seen[d.Location.String()] {
+		for _, r := range resps {
+			loc, err := r.Location()
+			if err != nil || seen[loc.String()] || !atGateway(loc, gw) {
 				continue
 			}
-			seen[d.Location.String()] = true
-			local := ""
-			if d.LocalAddr != nil {
-				local = d.LocalAddr.String()
-			} else if l, err := localAddrFor(d.Location); err == nil {
-				local = l
+			seen[loc.String()] = true
+			root, err := goupnp.DeviceByURLCtx(ctx, loc)
+			if err != nil {
+				continue
 			}
-			out = append(out, gatewaysFrom(d.Root, d.Location, local, desc)...)
+			out = append(out, gatewaysFrom(root, loc, local, desc)...)
 		}
 	}
 	return out
+}
+
+// atGateway reports whether an SSDP answer's description URL is on the
+// default gateway's own address.
+func atGateway(loc *url.URL, gw netip.Addr) bool {
+	if loc == nil || (loc.Scheme != "http" && loc.Scheme != "https") {
+		return false
+	}
+	a, err := netip.ParseAddr(loc.Hostname())
+	return err == nil && gw.IsValid() && a.Unmap() == gw.Unmap()
 }

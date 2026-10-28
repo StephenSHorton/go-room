@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ type fakeIGD struct {
 	mu            sync.Mutex
 	external      string
 	maps          map[string]uint32 // "TCP:24817" -> lease
+	owners        map[string]string // "TCP:24817" -> "client|description"
 	taken         map[string]bool   // external ports held by someone else
 	onlyPermanent bool
 	refuse        bool
@@ -61,7 +63,7 @@ const igdDesc = `<?xml version="1.0"?>
 </root>`
 
 func newFakeIGD(t *testing.T, external string) *fakeIGD {
-	f := &fakeIGD{external: external, maps: map[string]uint32{}, taken: map[string]bool{}}
+	f := &fakeIGD{external: external, maps: map[string]uint32{}, owners: map[string]string{}, taken: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/desc.xml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
@@ -101,11 +103,21 @@ func (f *fakeIGD) control(w http.ResponseWriter, r *http.Request) {
 			soapFault(w, 725, "OnlyPermanentLeasesSupported")
 		default:
 			f.maps[key] = uint32(lease)
+			f.owners[key] = args["NewInternalClient"] + "|" + args["NewPortMappingDescription"]
 			soapOK(w, action, "")
 		}
 	case "DeletePortMapping":
 		delete(f.maps, key)
+		delete(f.owners, key)
 		soapOK(w, action, "")
+	case "GetSpecificPortMappingEntry":
+		lease, ok := f.maps[key]
+		if !ok {
+			soapFault(w, 714, "NoSuchEntryInArray")
+			return
+		}
+		client, desc, _ := strings.Cut(f.owners[key], "|")
+		soapOK(w, action, fmt.Sprintf("<NewInternalPort>1</NewInternalPort><NewInternalClient>%s</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>%s</NewPortMappingDescription><NewLeaseDuration>%d</NewLeaseDuration>", client, desc, lease))
 	default:
 		soapFault(w, 401, "Invalid Action")
 	}
@@ -306,6 +318,73 @@ func TestUPnPConflictAndPermanent(t *testing.T) {
 		if lease != 0 {
 			t.Fatalf("%s lease %d, want permanent", k, lease)
 		}
+	}
+}
+
+// A mapping an earlier run left is removed before mapping, but only when
+// it points at this machine with this app's description.
+func TestUPnPRemovesStaleMappings(t *testing.T) {
+	fast(t)
+	f := newFakeIGD(t, "203.0.113.9")
+	f.maps["TCP:25000"], f.owners["TCP:25000"] = 0, "127.0.0.1|go-room"
+	f.maps["UDP:25001"], f.owners["UDP:25001"] = 0, "127.0.0.1|go-room"
+	f.maps["TCP:25002"], f.owners["TCP:25002"] = 0, "192.168.1.9|go-room"
+	gws := f.gateways(t)
+	m := Start(Config{Ports: ports, Discover: func(context.Context) ([]Gateway, error) { return gws, nil },
+		Stale: []Port{{Proto: "tcp", External: 25000}, {Proto: "udp", External: 25001}, {Proto: "tcp", External: 25002}}})
+	defer m.Close()
+	waitState(t, m, StateOK)
+	got := f.mapped()
+	if _, ok := got["TCP:25000"]; ok {
+		t.Fatal("this machine's old TCP mapping stayed")
+	}
+	if _, ok := got["UDP:25001"]; ok {
+		t.Fatal("this machine's old UDP mapping stayed")
+	}
+	if _, ok := got["TCP:25002"]; !ok {
+		t.Fatal("another machine's mapping was removed")
+	}
+}
+
+// The external address is re-read between renewals.
+func TestMapperNoticesANewExternalAddress(t *testing.T) {
+	fast(t)
+	old := ipPoll
+	ipPoll = 20 * time.Millisecond
+	t.Cleanup(func() { ipPoll = old })
+	f := newFakeIGD(t, "203.0.113.9")
+	gws := f.gateways(t)
+	m := Start(Config{Ports: ports, Discover: func(context.Context) ([]Gateway, error) { return gws, nil }})
+	defer m.Close()
+	waitState(t, m, StateOK)
+	f.mu.Lock()
+	f.external = "198.51.100.4"
+	f.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.Status().External != netip.MustParseAddr("198.51.100.4") {
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v", m.Status())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAtGateway(t *testing.T) {
+	gw := netip.MustParseAddr("192.168.1.1")
+	for raw, want := range map[string]bool{
+		"http://192.168.1.1:5000/rootDesc.xml": true,
+		"http://192.168.1.77:5000/desc.xml":    false,
+		"http://router.lan:5000/desc.xml":      false,
+		"file://192.168.1.1/desc.xml":          false,
+	} {
+		u, _ := url.Parse(raw)
+		if atGateway(u, gw) != want {
+			t.Fatalf("atGateway(%s) != %v", raw, want)
+		}
+	}
+	u, _ := url.Parse("http://192.168.1.1/x")
+	if atGateway(u, netip.Addr{}) {
+		t.Fatal("no gateway, yet kept")
 	}
 }
 

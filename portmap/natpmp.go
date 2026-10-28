@@ -149,20 +149,20 @@ func (g *natpmpGateway) Unmap(ctx context.Context, p Port) error {
 	return err
 }
 
-// discoverDefault is Config.Discover's default: IGDs by SSDP, then NAT-PMP
-// at the default gateway.
+// discoverDefault is Config.Discover's default: an IGD by SSDP at the
+// default gateway, then NAT-PMP there.
 func discoverDefault(desc string) func(ctx context.Context) ([]Gateway, error) {
 	return func(ctx context.Context) ([]Gateway, error) {
-		gws := discoverUPnP(ctx, desc)
 		ip, err := gateway.DiscoverGateway()
-		if err == nil {
-			if a, ok := netip.AddrFromSlice(ip); ok && a.Unmap().Is4() {
-				gws = append(gws, NATPMP(netip.AddrPortFrom(a.Unmap(), NATPMPPort)))
-			}
-		}
-		if len(gws) == 0 && err != nil {
+		if err != nil {
 			return nil, err
 		}
-		return gws, nil
+		gw, ok := netip.AddrFromSlice(ip)
+		if !ok || !gw.Unmap().Is4() {
+			return nil, fmt.Errorf("the default gateway %v isn't IPv4", ip)
+		}
+		gw = gw.Unmap()
+		gws := discoverUPnP(ctx, desc, gw)
+		return append(gws, NATPMP(netip.AddrPortFrom(gw, NATPMPPort))), nil
 	}
 }
