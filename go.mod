@@ -1,10 +1,12 @@
 module github.com/StephenSHorton/go-room
 
-go 1.26
+go 1.26.2
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/go-ole/go-ole v1.3.0
+	github.com/huin/goupnp v1.3.0
+	github.com/jackpal/gateway v1.1.2
 	github.com/pion/datachannel v1.6.3
 	github.com/pion/ice/v4 v4.4.8
 	github.com/pion/logging v0.2.4
