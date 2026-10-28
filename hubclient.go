@@ -424,6 +424,9 @@ func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Durati
 	if c.cfg.Identity == nil {
 		return errors.New("room: a guest can't open guest topics")
 	}
+	if err := ctx.Err(); err != nil {
+		return err // the window closed before this ran
+	}
 	until := time.Now().Add(ttl)
 	// Recorded first: a connection that comes up while this waits sends it
 	// (run), and a CloseGuest meanwhile removes it, so it isn't sent after.
@@ -431,6 +434,15 @@ func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Durati
 	c.guests[topic] = until
 	c.mu.Unlock()
 	if err := c.waitUp(ctx); err != nil {
+		if ctx.Err() != nil {
+			// Given up on (the caller's window ended): a later connection
+			// mustn't open it either.
+			c.mu.Lock()
+			if c.guests[topic] == until {
+				delete(c.guests, topic)
+			}
+			c.mu.Unlock()
+		}
 		return err
 	}
 	c.mu.Lock()

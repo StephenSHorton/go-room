@@ -686,6 +686,18 @@ func TestHubGuestOpenAfterCloseIsDropped(t *testing.T) {
 	go func() { done <- c.OpenGuest(context.Background(), "pair/x", time.Minute) }()
 	time.Sleep(50 * time.Millisecond)
 	c.CloseGuest("pair/x")
+	// A window already closed (its ctx cancelled) before OpenGuest ran, and
+	// one given up on while the hub was down: neither is opened later.
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.OpenGuest(gone, "pair/y", time.Minute); err == nil {
+		t.Fatal("OpenGuest with a cancelled ctx succeeded")
+	}
+	short, cancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel2()
+	if err := c.OpenGuest(short, "pair/z", time.Minute); err == nil {
+		t.Fatal("OpenGuest succeeded with the hub down")
+	}
 	reach.Lock()
 	addr = th.addr
 	reach.Unlock()
@@ -696,9 +708,11 @@ func TestHubGuestOpenAfterCloseIsDropped(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	th.hub.mu.Lock()
 	_, open := th.hub.guests["pair/x"]
+	_, openY := th.hub.guests["pair/y"]
+	_, openZ := th.hub.guests["pair/z"]
 	th.hub.mu.Unlock()
-	if open {
-		t.Fatal("the closed pairing was opened on the hub")
+	if open || openY || openZ {
+		t.Fatalf("a closed pairing was opened on the hub: x %v y %v z %v", open, openY, openZ)
 	}
 }
 
