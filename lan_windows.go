@@ -146,18 +146,26 @@ func publicAdapterGUIDs() (map[string]bool, error) {
 			}
 			defer nc.Release()
 			vt := (*iNetworkConnectionVtbl)(unsafe.Pointer(nc.RawVTable))
+			// Each out-parameter's uintptr(unsafe.Pointer(&x)) sits in the
+			// syscall.SyscallN argument list itself: only there does the
+			// compiler keep x alive and in place for the call. Through a
+			// wrapper the address is a plain integer, and a stack growth on
+			// the way in moves x out from under it.
 			var id ole.GUID
-			if hresult(syscallN(vt.GetAdapterID, uintptr(unsafe.Pointer(nc)), uintptr(unsafe.Pointer(&id)))) != nil {
+			r, _, _ := syscall.SyscallN(vt.GetAdapterID, uintptr(unsafe.Pointer(nc)), uintptr(unsafe.Pointer(&id)))
+			if hresult(r) != nil {
 				return nil
 			}
 			var net *ole.IDispatch
-			if hresult(syscallN(vt.GetNetwork, uintptr(unsafe.Pointer(nc)), uintptr(unsafe.Pointer(&net)))) != nil || net == nil {
+			r, _, _ = syscall.SyscallN(vt.GetNetwork, uintptr(unsafe.Pointer(nc)), uintptr(unsafe.Pointer(&net)))
+			if hresult(r) != nil || net == nil {
 				return nil
 			}
 			defer net.Release()
 			nv := (*iNetworkVtbl)(unsafe.Pointer(net.RawVTable))
 			var cat int32
-			if hresult(syscallN(nv.GetCategory, uintptr(unsafe.Pointer(net)), uintptr(unsafe.Pointer(&cat)))) != nil {
+			r, _, _ = syscall.SyscallN(nv.GetCategory, uintptr(unsafe.Pointer(net)), uintptr(unsafe.Pointer(&cat)))
+			if hresult(r) != nil {
 				return nil
 			}
 			if cat == nlmCategoryPublic {
@@ -188,9 +196,4 @@ func hresult(r uintptr) error {
 		return ole.NewError(r)
 	}
 	return nil
-}
-
-func syscallN(fn uintptr, args ...uintptr) uintptr {
-	r, _, _ := syscall.SyscallN(fn, args...)
-	return r
 }

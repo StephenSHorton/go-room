@@ -1,6 +1,6 @@
 module github.com/StephenSHorton/go-room
 
-go 1.26
+go 1.26.2
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
