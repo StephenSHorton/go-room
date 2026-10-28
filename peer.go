@@ -164,7 +164,7 @@ func (p *Peer) OpenStream(ctx context.Context, label string) (*Stream, error) {
 	select {
 	case s := <-opened:
 		if !p.track(s) {
-			s.abort()
+			s.abort(p.closedErr())
 			return nil, p.closedErr()
 		}
 		return s, nil
@@ -405,7 +405,7 @@ func (p *Peer) incoming(label string, dc *datachannel.DataChannel) {
 		p.mu.Unlock()
 	})
 	if !p.track(s) {
-		s.abort()
+		s.abort(p.closedErr())
 		return
 	}
 	p.mu.Lock()
@@ -444,7 +444,7 @@ func (p *Peer) close(err error, bye bool, reason string) {
 			msgs.close(err)
 		}
 		for _, s := range streams {
-			s.abort()
+			s.abort(err)
 		}
 		if bye {
 			_ = p.m.sig.Send(p.id, MsgBye, byeBody{Session: p.session, Reason: reason})

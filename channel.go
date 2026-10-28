@@ -238,6 +238,9 @@ func (c *Channel) closedErr() error {
 // Peer.OpenStream or received through Peer.OnStream. Writes go out in 16 KiB
 // pieces under the same flow control as Channel. Close flushes what was
 // written, then closes the channel; the other side's Read returns io.EOF.
+// When the peer goes down, Read usually returns the peer's error instead,
+// but a connection that dies at the wrong moment can still look like
+// io.EOF: check lengths or hashes before trusting a stream as complete.
 type Stream struct {
 	label   string
 	dc      *datachannel.DataChannel
@@ -248,9 +251,10 @@ type Stream struct {
 	rbuf []byte
 	rest []byte
 
-	wmu  sync.Mutex
-	done chan struct{}
-	once sync.Once
+	wmu      sync.Mutex
+	done     chan struct{}
+	once     sync.Once
+	abortErr error // set before done closes when the peer went away
 }
 
 func newStream(label string, dc *datachannel.DataChannel, release func()) *Stream {
@@ -274,6 +278,9 @@ func (s *Stream) Read(p []byte) (int, error) {
 		if err != nil {
 			select {
 			case <-s.done:
+				if s.abortErr != nil {
+					return 0, s.abortErr
+				}
 				return 0, io.EOF
 			default:
 			}
@@ -326,9 +333,14 @@ func (s *Stream) Close() error {
 	return err
 }
 
-// abort closes the stream without flushing (its peer went away).
-func (s *Stream) abort() {
+// abort closes the stream without flushing (its peer went away); a Read
+// after it returns err rather than io.EOF.
+func (s *Stream) abort(err error) {
 	s.once.Do(func() {
+		if err == nil {
+			err = ErrClosed
+		}
+		s.abortErr = err
 		close(s.done)
 		_ = s.dc.Close()
 		if s.release != nil {
