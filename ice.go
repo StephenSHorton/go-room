@@ -70,14 +70,26 @@ type RelayStatus struct {
 	Expires int64  `json:"expires,omitempty"` // unix ms the current credentials stop working
 }
 
+// TURNCreds are one set of short-lived TURN credentials and the URLs they
+// work on.
+type TURNCreds struct {
+	Username   string        `json:"username"`
+	Credential string        `json:"credential"`
+	TTL        time.Duration `json:"-"`
+	URIs       []string      `json:"uris,omitempty"`
+}
+
 // RelayConfig sets up an optional TURN relay with short-lived credentials
 // (the TURN REST scheme).
 type RelayConfig struct {
 	// CredentialURL answers GET ?peer=<peer> with {username, credential (or
 	// password), ttl, uris}. It must be https, except on loopback.
 	CredentialURL string
-	// TurnURLs, when set, replace the uris the credential endpoint returns.
+	// TurnURLs, when set, replace the uris the credentials come with.
 	TurnURLs []string
+	// Fetch, when set, replaces the HTTP fetch from CredentialURL: the loop
+	// calls it for fresh credentials (an app with a hub: HubClient.TURN).
+	Fetch func(ctx context.Context) (TURNCreds, error)
 	// Logf, when set, gets credential failures.
 	Logf func(format string, args ...any)
 }
@@ -107,6 +119,7 @@ var (
 type Relay struct {
 	turnURLs []string
 	credURL  string
+	fetchFn  func(context.Context) (TURNCreds, error)
 	peer     string
 	client   *http.Client
 	onChange func()
@@ -132,6 +145,7 @@ func NewRelay(cfg RelayConfig, peer string, onChange func()) *Relay {
 	r := &Relay{
 		turnURLs: CleanICEURLs(cfg.TurnURLs),
 		credURL:  strings.TrimSpace(cfg.CredentialURL),
+		fetchFn:  cfg.Fetch,
 		peer:     peer,
 		client:   &http.Client{Timeout: credTimeout},
 		onChange: onChange,
@@ -141,6 +155,8 @@ func NewRelay(cfg RelayConfig, peer string, onChange func()) *Relay {
 		loopDone: make(chan struct{}),
 	}
 	switch {
+	case r.fetchFn != nil:
+		r.status = RelayStatus{State: RelayPending}
 	case r.credURL == "" && len(r.turnURLs) > 0:
 		r.status = RelayStatus{State: RelayNone, Detail: "turnUrls needs a credentialUrl to get relay credentials"}
 	case r.credURL == "":
@@ -152,11 +168,11 @@ func NewRelay(cfg RelayConfig, peer string, onChange func()) *Relay {
 }
 
 // Start begins fetching and refreshing credentials; a no-op with no
-// CredentialURL. It never blocks.
+// CredentialURL or Fetch. It never blocks.
 func (r *Relay) Start() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.credURL == "" || r.started || r.stopped {
+	if (r.credURL == "" && r.fetchFn == nil) || r.started || r.stopped {
 		return
 	}
 	r.started = true
@@ -187,21 +203,35 @@ func (r *Relay) Status() RelayStatus {
 // Servers is the ICE list right now: STUN, then TURN while the credentials
 // haven't expired. Pass it as Config.ICE.
 func (r *Relay) Servers() []ICEServer {
-	out := append([]ICEServer(nil), DefaultSTUN...)
+	return append(append([]ICEServer(nil), DefaultSTUN...), r.TURN()...)
+}
+
+// TURN is the list without DefaultSTUN, for an app that brings its own (a
+// home server): while the credentials haven't expired, their turn: and
+// turns: URLs with the credentials, and any stun: URLs they came with as an
+// entry of their own; nil otherwise.
+func (r *Relay) TURN() []ICEServer {
+	var out []ICEServer
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.user == "" || !r.now().Before(r.expires) {
-		return out
+		return nil
 	}
 	urls := r.turnURLs
 	if len(urls) == 0 {
 		urls = r.uris
 	}
-	var turn []string
+	var turn, stun []string
 	for _, u := range urls {
-		if l := strings.ToLower(u); strings.HasPrefix(l, "turn:") || strings.HasPrefix(l, "turns:") {
+		switch l := strings.ToLower(u); {
+		case strings.HasPrefix(l, "turn:") || strings.HasPrefix(l, "turns:"):
 			turn = append(turn, u)
+		case strings.HasPrefix(l, "stun:"):
+			stun = append(stun, u)
 		}
+	}
+	if len(stun) > 0 {
+		out = append(out, ICEServer{URLs: stun})
 	}
 	if len(turn) > 0 {
 		out = append(out, ICEServer{URLs: turn, Username: r.user, Credential: r.pass})
@@ -255,9 +285,28 @@ func (r *Relay) loop() {
 	}
 }
 
-// fetch asks the credential endpoint for fresh TURN credentials.
+// fetch gets fresh TURN credentials from Fetch or the credential endpoint.
 func (r *Relay) fetch() (turnCreds, error) {
 	var c turnCreds
+	if r.fetchFn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), credTimeout)
+		defer cancel()
+		go func() {
+			select {
+			case <-r.quit:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		tc, err := r.fetchFn(ctx)
+		if err != nil {
+			return c, err
+		}
+		if tc.Username == "" || tc.Credential == "" {
+			return c, errors.New("relay credentials: no username or credential")
+		}
+		return turnCreds{Username: tc.Username, Credential: tc.Credential, TTL: int(tc.TTL / time.Second), URIs: tc.URIs}, nil
+	}
 	u, err := url.Parse(r.credURL)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return c, errors.New("credentialUrl isn't an http(s) URL")
