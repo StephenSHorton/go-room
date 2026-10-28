@@ -641,3 +641,131 @@ func TestFrames(t *testing.T) {
 		t.Fatal("short topic body")
 	}
 }
+
+// A member's guest topic survives a short drop of its connection, and
+// closes when the member doesn't come back.
+func TestHubGuestTopicOutlivesABlip(t *testing.T) {
+	fastHubRetry(t)
+	old := hubGuestGrace
+	hubGuestGrace = 400 * time.Millisecond
+	t.Cleanup(func() { hubGuestGrace = old })
+	th := newTestHub(t, nil)
+	ca, _ := th.member(t, "dev-a")
+	waitFor(t, "connected", ca.Up)
+	if err := ca.OpenGuest(context.Background(), "pair/x", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	g := th.guest(t, "pair/x")
+	waitFor(t, "guest admitted", g.Up)
+	// The member's connection drops; it reconnects by itself.
+	ca.mu.Lock()
+	_ = ca.tc.Close()
+	ca.mu.Unlock()
+	time.Sleep(hubGuestGrace + 200*time.Millisecond)
+	if !g.Up() {
+		t.Fatal("the guest was dropped by its member's blip")
+	}
+	// The member goes for good: the topic closes after the grace.
+	ca.Close()
+	waitFor(t, "guest dropped", func() bool { return !g.Up() })
+}
+
+// A pairing closed while the hub was unreachable isn't opened on it later.
+func TestHubGuestOpenAfterCloseIsDropped(t *testing.T) {
+	fastHubRetry(t)
+	th := newTestHub(t, nil)
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	th.certify("dev-a", pub)
+	ident := KeyIdentity(key)
+	var reach sync.Mutex
+	addr := "127.0.0.1:1"
+	c := DialHub(HubDialConfig{Self: "dev-a", Identity: &ident, Expect: th.expect, Logf: t.Logf,
+		Addrs: func() []string { reach.Lock(); defer reach.Unlock(); return []string{addr} }})
+	t.Cleanup(c.Close)
+	done := make(chan error, 1)
+	go func() { done <- c.OpenGuest(context.Background(), "pair/x", time.Minute) }()
+	time.Sleep(50 * time.Millisecond)
+	c.CloseGuest("pair/x")
+	reach.Lock()
+	addr = th.addr
+	reach.Unlock()
+	waitFor(t, "connected", c.Up)
+	if err := <-done; err == nil {
+		t.Fatal("OpenGuest reported success for a closed pairing")
+	}
+	time.Sleep(100 * time.Millisecond)
+	th.hub.mu.Lock()
+	_, open := th.hub.guests["pair/x"]
+	th.hub.mu.Unlock()
+	if open {
+		t.Fatal("the closed pairing was opened on the hub")
+	}
+}
+
+// A turn.creds reply that nobody waits for anymore doesn't land on a later
+// request.
+func TestHubTURNRepliesByID(t *testing.T) {
+	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcfg := TURNConfig{UDP: udp, RelayIP: netip.MustParseAddr("127.0.0.1")}
+	_, _ = rand.Read(tcfg.Key[:])
+	ts, err := NewTURN(tcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+	th := newTestHub(t, func(c *HubConfig) {
+		c.TURN = ts
+		c.PublicUDP = func() netip.AddrPort { return netip.MustParseAddrPort("127.0.0.1:4000") }
+	})
+	ca, _ := th.member(t, "dev-a")
+	waitFor(t, "connected", ca.Up)
+	// A request whose reply was lost: its waiter is still in the table.
+	ca.mu.Lock()
+	ca.nextID++
+	ca.pending[ca.nextID] = make(chan hubTURNBody, 1)
+	ca.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	creds, err := ca.TURN(ctx)
+	if err != nil || creds.Username == "" {
+		t.Fatalf("TURN after a lost reply: %v", err)
+	}
+	// The hub's public UDP address applies to that host only.
+	if creds.URIs[0] != "stun:127.0.0.1:4000" || creds.URIs[2] != "turn:"+th.addr+"?transport=tcp" {
+		t.Fatalf("URIs %v", creds.URIs)
+	}
+	if got := defaultTURNURIs("203.0.113.7:24817", "203.0.113.7:31000"); got[0] != "stun:203.0.113.7:31000" ||
+		got[1] != "turn:203.0.113.7:31000?transport=udp" || got[2] != "turn:203.0.113.7:24817?transport=tcp" {
+		t.Fatalf("defaultTURNURIs %v", got)
+	}
+	if got := defaultTURNURIs("192.168.1.20:24817", "203.0.113.7:31000"); got[0] != "stun:192.168.1.20:24817" {
+		t.Fatalf("defaultTURNURIs at home %v", got)
+	}
+}
+
+func TestHubHandshakeLimitsByPrefix(t *testing.T) {
+	if limitKey(netip.MustParseAddr("2001:db8:1:2:aaaa::1")) != limitKey(netip.MustParseAddr("2001:db8:1:2:bbbb::9")) {
+		t.Fatal("one /64, two keys")
+	}
+	if limitKey(netip.MustParseAddr("192.0.2.1")) == limitKey(netip.MustParseAddr("192.0.2.2")) {
+		t.Fatal("two IPv4 hosts, one key")
+	}
+	th := newTestHub(t, func(c *HubConfig) { c.Limits.Handshakes = 2 })
+	a, b, c := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.3")
+	if !th.hub.admit(a) || !th.hub.admit(b) || th.hub.admit(c) {
+		t.Fatal("Handshakes=2 didn't cap the total in flight")
+	}
+	th.hub.handshakeDone(a, handshakeNotOpen)
+	if !th.hub.admit(c) {
+		t.Fatal("a finished handshake didn't free its slot")
+	}
+	th.hub.mu.Lock()
+	_, backedOff := th.hub.fails[a]
+	th.hub.mu.Unlock()
+	if backedOff {
+		t.Fatal("a guest whose topic wasn't open was backed off")
+	}
+}

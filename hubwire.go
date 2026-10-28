@@ -40,8 +40,8 @@ const (
 	frameMsg        byte = 6  // hub: topic, sealed payload
 	frameGuestOpen  byte = 7  // member: {topic, ttlMs}
 	frameGuestClose byte = 8  // member: {topic}
-	frameTURNGet    byte = 9  // client: {}
-	frameTURNCreds  byte = 10 // hub: {username, credential, ttlS}
+	frameTURNGet    byte = 9  // client: {id}
+	frameTURNCreds  byte = 10 // hub: {id, username, credential, ttlS}
 	framePing       byte = 11 // either
 	framePong       byte = 12 // either
 	frameErr        byte = 13 // hub: {reason}, before a close, members only
@@ -59,6 +59,7 @@ var (
 	hubHelloTimeout = 5 * time.Second  // TLS handshake plus hello
 	hubPingEvery    = 15 * time.Second // client pings; the hub answers
 	hubIdleTimeout  = 45 * time.Second // silence that closes a connection
+	hubGuestGrace   = 45 * time.Second // a member's guest topics outlive its last connection by this
 	hubWriteTimeout = 10 * time.Second
 	hubDialTimeout  = 10 * time.Second
 	hubRetryMin     = time.Second
@@ -87,9 +88,13 @@ type hubGuestBody struct {
 }
 
 type hubTURNBody struct {
+	ID         uint64 `json:"id,omitempty"` // turn.get's, echoed in turn.creds
 	Username   string `json:"username,omitempty"`
 	Credential string `json:"credential,omitempty"`
 	TTLS       int64  `json:"ttlS,omitempty"`
+	// UDP is the hub's public address for its UDP port when the router
+	// mapped it to another external port than TCP's ("ip:port").
+	UDP string `json:"udp,omitempty"`
 }
 
 type hubErrBody struct {

@@ -1,7 +1,9 @@
 package room
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -163,4 +165,24 @@ func TestRelayRejectsPlainHTTP(t *testing.T) {
 	if _, err := r.fetch(); err == nil || !strings.Contains(err.Error(), "https") {
 		t.Fatalf("fetch over plain http to a remote host: %v", err)
 	}
+}
+
+// Kick skips a backoff that grew while the credential source was down.
+func TestRelayKick(t *testing.T) {
+	oldMin, oldMax := retryMin, retryMax
+	retryMin, retryMax = time.Minute, time.Minute
+	t.Cleanup(func() { retryMin, retryMax = oldMin, oldMax })
+	var up atomic.Bool
+	r := NewRelay(RelayConfig{Fetch: func(context.Context) (TURNCreds, error) {
+		if !up.Load() {
+			return TURNCreds{}, errors.New("hub down")
+		}
+		return TURNCreds{Username: "1:a", Credential: "c", TTL: time.Hour, URIs: []string{"turn:192.0.2.1:1?transport=udp"}}, nil
+	}}, "a", nil)
+	r.Start()
+	defer r.Stop()
+	waitFor(t, "first failure", func() bool { return r.Status().State == RelayError })
+	up.Store(true)
+	r.Kick()
+	waitFor(t, "credentials after a kick", func() bool { return r.Status().State == RelayOK })
 }

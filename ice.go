@@ -133,6 +133,7 @@ type Relay struct {
 	expires  time.Time
 	status   RelayStatus
 	quit     chan struct{}
+	kick     chan struct{}
 	started  bool
 	stopped  bool
 	loopDone chan struct{}
@@ -152,6 +153,7 @@ func NewRelay(cfg RelayConfig, peer string, onChange func()) *Relay {
 		logf:     cfg.Logf,
 		now:      time.Now,
 		quit:     make(chan struct{}),
+		kick:     make(chan struct{}, 1),
 		loopDone: make(chan struct{}),
 	}
 	switch {
@@ -190,6 +192,23 @@ func (r *Relay) Stop() {
 	r.mu.Unlock()
 	if started {
 		<-r.loopDone
+	}
+}
+
+// Kick fetches again now, with the backoff reset, unless the credentials
+// in hand are good: call it when the source of credentials came back (a
+// hub reconnected), so a backoff that grew while it was down isn't waited
+// out.
+func (r *Relay) Kick() {
+	r.mu.Lock()
+	good := r.status.State == RelayOK && r.now().Before(r.expires)
+	r.mu.Unlock()
+	if good {
+		return
+	}
+	select {
+	case r.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -280,6 +299,8 @@ func (r *Relay) loop() {
 		select {
 		case <-r.quit:
 			return
+		case <-r.kick:
+			backoff = retryMin
 		case <-time.After(wait):
 		}
 	}

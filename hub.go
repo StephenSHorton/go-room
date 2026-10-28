@@ -37,7 +37,8 @@ type HubPeer struct {
 type HubLimits struct {
 	Members         int           // member connections [64]
 	Guests          int           // guest connections [8]
-	HandshakesPerIP int           // handshakes in flight per remote IP [4]
+	HandshakesPerIP int           // handshakes in flight per remote IP (an IPv6 /64 is one) [4]
+	Handshakes      int           // handshakes in flight in total [64]
 	TopicsPerConn   int           // subscriptions per connection [8]
 	GuestsPerMember int           // guest topics one member may have open [2]
 	PubRate         float64       // pub frames per second per connection [50]
@@ -54,6 +55,7 @@ func (l HubLimits) withDefaults() HubLimits {
 	def(&l.Members, 64)
 	def(&l.Guests, 8)
 	def(&l.HandshakesPerIP, 4)
+	def(&l.Handshakes, 64)
 	def(&l.TopicsPerConn, 8)
 	def(&l.GuestsPerMember, 2)
 	if l.PubRate <= 0 {
@@ -84,6 +86,10 @@ type HubConfig struct {
 	// TURN, when set, answers turn.get: members get Issue(id), guests
 	// IssueGuest until their topic closes.
 	TURN *TURNServer
+	// PublicUDP, when set, is the public address of TURN's UDP port as the
+	// router mapped it; it rides in turn.creds so a device that dialed the
+	// public TCP address finds UDP when the router gave it another port.
+	PublicUDP func() netip.AddrPort
 	// Bridge, when set, carries open guest topics between this LAN and the
 	// hub both ways, so a device at home with only a pairing code reaches a
 	// member away from home.
@@ -105,9 +111,10 @@ type Hub struct {
 	conns     map[*hubConn]bool
 	topics    map[string]*hubTopic
 	guests    map[string]*guestTopic
-	inflight  map[netip.Addr]int
-	fails     map[netip.Addr]*hubFail
-	pending   map[net.Conn]bool // connections still in their handshake
+	inflight  map[netip.Addr]int // by limitKey
+	nInflight int
+	fails     map[netip.Addr]*hubFail // by limitKey
+	pending   map[net.Conn]bool       // connections still in their handshake
 	listeners []net.Listener
 	closed    bool
 	wg        sync.WaitGroup
@@ -123,6 +130,7 @@ type guestTopic struct {
 	expires time.Time
 	timer   *time.Timer
 	bridge  Leg
+	orphan  *time.Timer // the owner's last connection dropped: closes it after hubGuestGrace
 }
 
 type hubFail struct {
@@ -222,6 +230,9 @@ func (h *Hub) Close() {
 	var bridges []Leg
 	for topic, g := range h.guests {
 		g.timer.Stop()
+		if g.orphan != nil {
+			g.orphan.Stop()
+		}
 		if g.bridge != nil {
 			bridges = append(bridges, g.bridge)
 		}
@@ -247,7 +258,8 @@ func remoteAddr(c net.Conn) netip.AddrPort {
 	return addrPortOf(c.RemoteAddr())
 }
 
-// admit counts a handshake from ip, or refuses it (backoff, too many).
+// admit counts a handshake from ip (its limitKey), or refuses it
+// (backoff, too many from there, too many in all).
 func (h *Hub) admit(ip netip.Addr) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -257,10 +269,11 @@ func (h *Hub) admit(ip netip.Addr) bool {
 	if f := h.fails[ip]; f != nil && h.now().Before(f.until) {
 		return false
 	}
-	if h.inflight[ip] >= h.lim.HandshakesPerIP {
+	if h.inflight[ip] >= h.lim.HandshakesPerIP || h.nInflight >= h.lim.Handshakes {
 		return false
 	}
 	h.inflight[ip]++
+	h.nInflight++
 	return true
 }
 
@@ -278,14 +291,21 @@ func (h *Hub) setPending(c net.Conn, on bool) bool {
 	return true
 }
 
-func (h *Hub) handshakeDone(ip netip.Addr, ok bool) {
+// handshakeDone ends a handshake admit counted. A failed one backs the IP
+// off, unless it failed only for a reason an honest client hits (a guest
+// whose topic isn't open yet).
+func (h *Hub) handshakeDone(ip netip.Addr, res handshakeResult) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.inflight[ip]--; h.inflight[ip] <= 0 {
 		delete(h.inflight, ip)
 	}
-	if ok {
+	h.nInflight--
+	switch res {
+	case handshakeOK:
 		delete(h.fails, ip)
+		return
+	case handshakeNotOpen:
 		return
 	}
 	if h.lim.FailBackoff < 0 {
@@ -312,41 +332,54 @@ func (h *Hub) handshakeDone(ip netip.Addr, ok bool) {
 // wrong before the welcome closes it without a reply.
 func (h *Hub) handle(raw net.Conn) {
 	remote := remoteAddr(raw)
-	ip := remote.Addr()
-	if !h.admit(ip) || !h.setPending(raw, true) {
+	ip := limitKey(remote.Addr())
+	if !h.admit(ip) {
 		_ = raw.Close()
 		return
 	}
-	c, ok := h.handshake(raw, remote)
+	if !h.setPending(raw, true) {
+		h.handshakeDone(ip, handshakeNotOpen)
+		_ = raw.Close()
+		return
+	}
+	c, res := h.handshake(raw, remote)
 	h.setPending(raw, false)
-	h.handshakeDone(ip, ok)
-	if !ok {
+	h.handshakeDone(ip, res)
+	if res != handshakeOK {
 		_ = raw.Close()
 		return
 	}
 	h.serveConn(c)
 }
 
-func (h *Hub) handshake(raw net.Conn, remote netip.AddrPort) (*hubConn, bool) {
+type handshakeResult int
+
+const (
+	handshakeOK      handshakeResult = iota
+	handshakeFailed                  // counts toward the IP's backoff
+	handshakeNotOpen                 // a guest's topic isn't open, or the hub is full: no backoff
+)
+
+func (h *Hub) handshake(raw net.Conn, remote netip.AddrPort) (*hubConn, handshakeResult) {
 	deadline := time.Now().Add(hubHelloTimeout)
 	_ = raw.SetDeadline(deadline)
 	tc := tls.Server(raw, h.tlsCfg)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	if err := tc.HandshakeContext(ctx); err != nil {
-		return nil, false
+		return nil, handshakeFailed
 	}
 	x, err := hubExporter(tc.ConnectionState())
 	if err != nil {
-		return nil, false
+		return nil, handshakeFailed
 	}
 	typ, body, err := readFrame(tc, 4<<10)
 	if err != nil || typ != frameHello {
-		return nil, false
+		return nil, handshakeFailed
 	}
 	var hello hubHello
 	if parseJSON(body, &hello) != nil || hello.V != 1 {
-		return nil, false
+		return nil, handshakeFailed
 	}
 	c := &hubConn{h: h, tc: tc, subs: map[string]bool{}, wants: map[string]bool{}, out: make(chan []byte, 256), done: make(chan struct{}),
 		rate: newRate(h.lim.PubRate, h.lim.PubBurst)}
@@ -355,35 +388,35 @@ func (h *Hub) handshake(raw net.Conn, remote netip.AddrPort) (*hubConn, bool) {
 		c.guestTopic = hello.Topic
 	} else {
 		if !verifyHubSig(hubClientContext, x, hello.ID, hello.Pub, hello.Sig) {
-			return nil, false
+			return nil, handshakeFailed
 		}
 		pub := ed25519.PublicKey(hello.Pub)
 		if err := h.cfg.Authorize(hello.ID, pub); err != nil {
 			h.cfg.Logf("hub: refused %s: %v", hello.ID, err)
-			return nil, false
+			return nil, handshakeFailed
 		}
 		c.peer = HubPeer{ID: hello.ID, Pub: pub, Remote: remote}
 	}
-	if !h.register(c) {
-		return nil, false
+	if res := h.register(c); res != handshakeOK {
+		return nil, res
 	}
 	sig := h.cfg.Identity.Sign(hubSigPayload(hubServerContext, x, h.cfg.Self))
 	w := hubWelcome{V: 1, ID: h.cfg.Self, Pub: h.cfg.Identity.Pub, Sig: sig}
 	if err := writeFrame(tc, frameWelcome, marshal(w)); err != nil {
 		h.unregister(c)
-		return nil, false
+		return nil, handshakeFailed
 	}
 	_ = raw.SetDeadline(time.Time{})
-	return c, true
+	return c, handshakeOK
 }
 
 // register adds an authenticated connection, within the limits. A guest is
 // admitted only while its topic is open.
-func (h *Hub) register(c *hubConn) bool {
+func (h *Hub) register(c *hubConn) handshakeResult {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return false
+		return handshakeNotOpen
 	}
 	members, guests := 0, 0
 	for o := range h.conns {
@@ -395,13 +428,22 @@ func (h *Hub) register(c *hubConn) bool {
 	}
 	if c.peer.Guest {
 		if _, open := h.guests[c.guestTopic]; !open || guests >= h.lim.Guests {
-			return false
+			return handshakeNotOpen
 		}
 	} else if members >= h.lim.Members {
-		return false
+		return handshakeNotOpen
 	}
 	h.conns[c] = true
-	return true
+	if !c.peer.Guest {
+		// The owner is back: its guest topics stay open.
+		for _, g := range h.guests {
+			if g.owner == c.peer.ID && g.orphan != nil {
+				g.orphan.Stop()
+				g.orphan = nil
+			}
+		}
+	}
+	return handshakeOK
 }
 
 func (h *Hub) unregister(c *hubConn) {
@@ -414,33 +456,40 @@ func (h *Hub) unregister(c *hubConn) {
 	for topic := range c.subs {
 		h.unsubLocked(c, topic)
 	}
-	// A member's guest topics close with its last connection.
-	var closeTopics []string
-	if !c.peer.Guest {
-		still := false
-		for o := range h.conns {
-			if !o.peer.Guest && o.peer.ID == c.peer.ID {
-				still = true
-				break
-			}
-		}
-		if !still {
-			for topic, g := range h.guests {
-				if g.owner == c.peer.ID {
-					closeTopics = append(closeTopics, topic)
-				}
+	// A member's guest topics close hubGuestGrace after its last
+	// connection drops, so a blip in its network doesn't end a pairing.
+	if !c.peer.Guest && !h.memberConnectedLocked(c.peer.ID) {
+		for topic, g := range h.guests {
+			if g.owner == c.peer.ID && g.orphan == nil {
+				g.orphan = time.AfterFunc(hubGuestGrace, func() { h.orphaned(topic, g) })
 			}
 		}
 	}
 	turnUsers := c.turnUsers
 	h.mu.Unlock()
-	for _, t := range closeTopics {
-		h.CloseGuest(t)
-	}
 	if h.cfg.TURN != nil {
 		for _, u := range turnUsers {
 			h.cfg.TURN.revokeGuest(u)
 		}
+	}
+}
+
+func (h *Hub) memberConnectedLocked(id string) bool {
+	for o := range h.conns {
+		if !o.peer.Guest && o.peer.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// orphaned closes a guest topic whose owner didn't come back in time.
+func (h *Hub) orphaned(topic string, g *guestTopic) {
+	h.mu.Lock()
+	gone := h.guests[topic] == g && g.orphan != nil && !h.memberConnectedLocked(g.owner)
+	h.mu.Unlock()
+	if gone {
+		h.CloseGuest(topic)
 	}
 }
 
@@ -599,6 +648,9 @@ func (h *Hub) CloseGuest(topic string) {
 		return
 	}
 	g.timer.Stop()
+	if g.orphan != nil {
+		g.orphan.Stop()
+	}
 	delete(h.guests, topic)
 	var drop []*hubConn
 	for c := range h.conns {
@@ -769,7 +821,11 @@ func (h *Hub) serveConn(c *hubConn) {
 				}
 			}
 		case frameTURNGet:
-			c.send(frameBytes(frameTURNCreds, marshal(h.turnFor(c))))
+			var req hubTURNBody
+			_ = parseJSON(body, &req)
+			reply := h.turnFor(c)
+			reply.ID = req.ID
+			c.send(frameBytes(frameTURNCreds, marshal(reply)))
 		}
 	}
 }
@@ -841,7 +897,13 @@ func (h *Hub) turnFor(c *hubConn) hubTURNBody {
 	} else {
 		tc = h.cfg.TURN.Issue(c.peer.ID)
 	}
-	return hubTURNBody{Username: tc.Username, Credential: tc.Credential, TTLS: int64(tc.TTL / time.Second)}
+	b := hubTURNBody{Username: tc.Username, Credential: tc.Credential, TTLS: int64(tc.TTL / time.Second)}
+	if h.cfg.PublicUDP != nil {
+		if ap := h.cfg.PublicUDP(); ap.IsValid() {
+			b.UDP = ap.String()
+		}
+	}
+	return b
 }
 
 // --- the server's own rooms ----------------------------------------------

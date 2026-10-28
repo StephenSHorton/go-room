@@ -33,6 +33,10 @@ type HubDialConfig struct {
 	// at addr. nil: stun:, turn:?transport=udp and turn:?transport=tcp at
 	// addr itself, since a home server's TURN shares the hub's port number.
 	TURNURIs func(addr string) []string
+	// OnUp, when set, runs (on its own goroutine) each time the connection
+	// comes up: Irori kicks its TURN credential loop there, so relay
+	// credentials don't wait out a backoff that ran while the hub was down.
+	OnUp func()
 	// Logf, when set, gets diagnostics (never payloads or credentials).
 	Logf func(format string, args ...any)
 }
@@ -49,8 +53,9 @@ type HubClient struct {
 	srvPub  ed25519.PublicKey
 	upCh    chan struct{} // closed while connected
 	legs    map[string][]*hubClientLeg
-	guests  map[string]time.Time // guest topics this member opened, until
-	pending []chan hubTURNBody
+	guests  map[string]time.Time        // guest topics this member opened, until
+	pending map[uint64]chan hubTURNBody // turn.get requests by id
+	nextID  uint64
 	closed  bool
 	quit    chan struct{}
 	done    chan struct{}
@@ -70,12 +75,13 @@ func DialHub(cfg HubDialConfig) *HubClient {
 		cfg.Dial = func(ctx context.Context, addr string) (net.Conn, error) { return d.DialContext(ctx, "tcp", addr) }
 	}
 	c := &HubClient{
-		cfg:    cfg,
-		upCh:   make(chan struct{}),
-		legs:   map[string][]*hubClientLeg{},
-		guests: map[string]time.Time{},
-		quit:   make(chan struct{}),
-		done:   make(chan struct{}),
+		cfg:     cfg,
+		upCh:    make(chan struct{}),
+		legs:    map[string][]*hubClientLeg{},
+		guests:  map[string]time.Time{},
+		pending: map[uint64]chan hubTURNBody{},
+		quit:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 	go c.loop()
 	return c
@@ -306,6 +312,9 @@ func (c *HubClient) run(tc *tls.Conn, addr string, w hubWelcome) {
 	for _, up := range ups {
 		go up()
 	}
+	if c.cfg.OnUp != nil {
+		go c.cfg.OnUp()
+	}
 
 	pingDone := make(chan struct{})
 	go func() {
@@ -344,9 +353,8 @@ func (c *HubClient) run(tc *tls.Conn, addr string, w hubWelcome) {
 			var b hubTURNBody
 			_ = parseJSON(body, &b)
 			c.mu.Lock()
-			if len(c.pending) > 0 {
-				ch := c.pending[0]
-				c.pending = c.pending[1:]
+			if ch := c.pending[b.ID]; ch != nil {
+				delete(c.pending, b.ID)
 				ch <- b
 			}
 			c.mu.Unlock()
@@ -363,10 +371,10 @@ func (c *HubClient) run(tc *tls.Conn, addr string, w hubWelcome) {
 	c.mu.Lock()
 	c.tc, c.addr = nil, ""
 	c.upCh = make(chan struct{})
-	for _, ch := range c.pending {
+	for id, ch := range c.pending {
 		close(ch)
+		delete(c.pending, id)
 	}
-	c.pending = nil
 	c.mu.Unlock()
 	c.cfg.Logf("hub: disconnected from %s", addr)
 }
@@ -416,13 +424,22 @@ func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Durati
 	if c.cfg.Identity == nil {
 		return errors.New("room: a guest can't open guest topics")
 	}
+	until := time.Now().Add(ttl)
+	// Recorded first: a connection that comes up while this waits sends it
+	// (run), and a CloseGuest meanwhile removes it, so it isn't sent after.
+	c.mu.Lock()
+	c.guests[topic] = until
+	c.mu.Unlock()
 	if err := c.waitUp(ctx); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.guests[topic] = time.Now().Add(ttl)
+	_, open := c.guests[topic]
 	c.mu.Unlock()
-	return c.write(frameGuestOpen, marshal(hubGuestBody{Topic: topic, TTLMs: ttl.Milliseconds()}))
+	if !open {
+		return ErrClosed
+	}
+	return c.write(frameGuestOpen, marshal(hubGuestBody{Topic: topic, TTLMs: time.Until(until).Milliseconds()}))
 }
 
 // CloseGuest closes a guest topic this member opened.
@@ -446,10 +463,18 @@ func (c *HubClient) TURN(ctx context.Context) (TURNCreds, error) {
 		c.mu.Unlock()
 		return TURNCreds{}, ErrNotConnected
 	}
-	c.pending = append(c.pending, ch)
+	c.nextID++
+	id := c.nextID
+	c.pending[id] = ch
 	addr := c.addr
 	c.mu.Unlock()
-	if err := c.write(frameTURNGet, []byte("{}")); err != nil {
+	forget := func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}
+	if err := c.write(frameTURNGet, marshal(hubTURNBody{ID: id})); err != nil {
+		forget()
 		return TURNCreds{}, err
 	}
 	select {
@@ -460,18 +485,28 @@ func (c *HubClient) TURN(ctx context.Context) (TURNCreds, error) {
 		if b.Username == "" || b.Credential == "" {
 			return TURNCreds{}, errors.New("room: the hub has no relay")
 		}
-		uris := defaultTURNURIs(addr)
+		uris := defaultTURNURIs(addr, b.UDP)
 		if c.cfg.TURNURIs != nil {
 			uris = c.cfg.TURNURIs(addr)
 		}
 		return TURNCreds{Username: b.Username, Credential: b.Credential, TTL: time.Duration(b.TTLS) * time.Second, URIs: uris}, nil
 	case <-ctx.Done():
+		forget()
 		return TURNCreds{}, ctx.Err()
 	}
 }
 
-func defaultTURNURIs(addr string) []string {
-	return []string{"stun:" + addr, "turn:" + addr + "?transport=udp", "turn:" + addr + "?transport=tcp"}
+// defaultTURNURIs are STUN and TURN at the hub's own address, except that
+// UDP goes to udp (the hub's public UDP address) when addr is the same
+// public host: the router may have mapped UDP to another external port.
+func defaultTURNURIs(addr, udp string) []string {
+	ua := addr
+	if uh, up, err := net.SplitHostPort(udp); err == nil {
+		if h, _, err := net.SplitHostPort(addr); err == nil && h == uh {
+			ua = net.JoinHostPort(uh, up)
+		}
+	}
+	return []string{"stun:" + ua, "turn:" + ua + "?transport=udp", "turn:" + addr + "?transport=tcp"}
 }
 
 // Carrier is the hub connection as a Carrier.
