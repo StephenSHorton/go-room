@@ -36,9 +36,15 @@ type nodeOpts struct {
 // or talks to a public broker.
 func newNode(t *testing.T, hub *MemHub, s Secret, id string, o nodeOpts) *node {
 	t.Helper()
+	return newNodeOn(t, hub.Open(s, id, SignalOptions{}), id, o)
+}
+
+// newNodeOn is newNode on a signaler the test opened (any carriers).
+func newNodeOn(t *testing.T, sig Signaler, id string, o nodeOpts) *node {
+	t.Helper()
 	_, key, _ := ed25519.GenerateKey(rand.Reader)
 	n := &node{id: id, key: key, up: make(chan *Peer, 8), down: make(chan error, 8)}
-	n.sig = hub.Open(s, id, SignalOptions{})
+	n.sig = sig
 	ident := KeyIdentity(key)
 	if o.sign != nil {
 		ident.Sign = o.sign
