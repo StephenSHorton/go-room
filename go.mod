@@ -1,12 +1,12 @@
 module github.com/StephenSHorton/go-room
 
-go 1.26.2
+go 1.26
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/go-ole/go-ole v1.3.0
 	github.com/huin/goupnp v1.3.0
-	github.com/jackpal/gateway v1.1.2
+	github.com/jackpal/gateway v1.1.1
 	github.com/pion/datachannel v1.6.3
 	github.com/pion/ice/v4 v4.4.8
 	github.com/pion/logging v0.2.4
@@ -30,7 +30,10 @@ require (
 	github.com/pion/srtp/v3 v3.1.3 // indirect
 	github.com/pion/stun/v4 v4.0.1 // indirect
 	github.com/pion/transport/v5 v5.1.1 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
