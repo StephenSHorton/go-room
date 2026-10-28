@@ -6,10 +6,10 @@
 // network (OpenLAN), a hub on one of the app's own machines (NewHub,
 // DialHub, with NewTURN and package portmap beside it), or public MQTT
 // brokers (package mqtt). Every carrier sees only random bytes on a
-// random-looking topic. Once two members have found
-// each other, Mesh opens a pion PeerConnection between them, binds it to each
-// side's ed25519 identity with a signed-fingerprint handshake, and hands the
-// app one reliable ordered message channel plus on-demand byte streams.
+// random-looking topic. Once two members have found each other, Mesh opens
+// a pion PeerConnection between them, binds it to each side's ed25519
+// identity with a signed-fingerprint handshake, and hands the app one
+// reliable ordered message channel plus on-demand byte streams.
 //
 // It was extracted from Toru's rooms (internal/stream/room.go and ice.go).
 package room

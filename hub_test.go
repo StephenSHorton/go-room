@@ -205,6 +205,62 @@ func TestHubTopicsAndLocal(t *testing.T) {
 	noEnv(t, oyGot, "a topic the hub doesn't carry")
 }
 
+// A member that subscribes before the server's own room opens the topic
+// (a startup race, or a rotation the server hasn't reached yet) is granted
+// it when the room opens, without reconnecting.
+func TestHubGrantsLateTopic(t *testing.T) {
+	th := newTestHub(t, nil)
+	s := testSecret(t)
+	ca, _ := th.member(t, "dev-a")
+	waitFor(t, "connected", ca.Up)
+	sa, _ := openOn(t, s, "dev-a", ca.Carrier())
+	time.Sleep(200 * time.Millisecond) // the sub arrives and is held back
+	th.hub.mu.Lock()
+	n := len(th.hub.topics)
+	th.hub.mu.Unlock()
+	if n != 0 {
+		t.Fatal("a topic was granted before the server opened it")
+	}
+	_, srvGot := openOn(t, s, "srv", th.hub.Local())
+	if e := sendUntil(t, sa, "late", srvGot); e.From != "dev-a" {
+		t.Fatalf("server got %+v", e)
+	}
+	// Same for a guest window that opens after the member asked.
+	pair := testSecret(t)
+	sp, _ := openOn(t, pair, "dev-a", ca.Carrier())
+	cb, _ := th.member(t, "dev-b")
+	waitFor(t, "b", cb.Up)
+	_, bGot := openOn(t, pair, "dev-b", cb.Carrier())
+	time.Sleep(200 * time.Millisecond)
+	if err := th.hub.OpenGuest(pair.Topic, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	sendUntil(t, sp, "pair", bGot)
+}
+
+// After a failed handshake, the same IP is refused for the backoff, then
+// admitted again.
+func TestHubFailBackoff(t *testing.T) {
+	th := newTestHub(t, func(c *HubConfig) { c.Limits.FailBackoff = 400 * time.Millisecond })
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	th.certify("dev-x", pub)
+	good := func(x []byte) hubHello {
+		return hubHello{V: 1, ID: "dev-x", Pub: pub, Sig: ed25519.Sign(key, hubSigPayload(hubClientContext, x, "dev-x"))}
+	}
+	bad := func(x []byte) hubHello { h := good(x); h.Sig[0] ^= 1; return h }
+	if n, _ := rawHello(t, th.addr, []string{HubALPN}, bad); n != 0 {
+		t.Fatal("bad hello answered")
+	}
+	// Refused at once: not even a TLS handshake.
+	if n, err := rawHello(t, th.addr, []string{HubALPN}, good); n != 0 && err == nil {
+		t.Fatal("admitted during the backoff")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n, err := rawHello(t, th.addr, []string{HubALPN}, good); n == 0 || err != nil {
+		t.Fatalf("still refused after the backoff: %d %v", n, err)
+	}
+}
+
 func rawHello(t *testing.T, addr string, alpn []string, hello func(x []byte) hubHello) (int, error) {
 	t.Helper()
 	tc, err := tls.Dial("tcp4", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, NextProtos: alpn}) //nolint:gosec // test

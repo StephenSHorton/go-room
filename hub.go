@@ -348,7 +348,7 @@ func (h *Hub) handshake(raw net.Conn, remote netip.AddrPort) (*hubConn, bool) {
 	if parseJSON(body, &hello) != nil || hello.V != 1 {
 		return nil, false
 	}
-	c := &hubConn{h: h, tc: tc, subs: map[string]bool{}, out: make(chan []byte, 256), done: make(chan struct{}),
+	c := &hubConn{h: h, tc: tc, subs: map[string]bool{}, wants: map[string]bool{}, out: make(chan []byte, 256), done: make(chan struct{}),
 		rate: newRate(h.lim.PubRate, h.lim.PubBurst)}
 	if hello.Guest {
 		c.peer = HubPeer{Guest: true, Remote: remote}
@@ -560,6 +560,7 @@ func (h *Hub) openGuest(topic string, ttl time.Duration, owner string) error {
 	g := &guestTopic{owner: owner, expires: h.now().Add(ttl)}
 	g.timer = time.AfterFunc(ttl, func() { h.expireGuest(topic, g) })
 	h.guests[topic] = g
+	h.regrantLocked(topic)
 	h.mu.Unlock()
 	if h.cfg.Bridge != nil {
 		leg, err := h.cfg.Bridge.Carrier().Join(topic, func(p []byte, _ netip.AddrPort) { h.route(topic, p, nil, nil, true) }, nil)
@@ -580,9 +581,10 @@ func (h *Hub) openGuest(topic string, ttl time.Duration, owner string) error {
 
 func (h *Hub) expireGuest(topic string, g *guestTopic) {
 	h.mu.Lock()
-	cur := h.guests[topic]
+	// A renewal may have reset the timer after this fire was queued.
+	stale := h.guests[topic] == g && !h.now().Before(g.expires)
 	h.mu.Unlock()
-	if cur == g {
+	if stale {
 		h.CloseGuest(topic)
 	}
 }
@@ -659,7 +661,8 @@ type hubConn struct {
 	tc         *tls.Conn
 	peer       HubPeer
 	guestTopic string
-	subs       map[string]bool // under h.mu
+	subs       map[string]bool // granted subscriptions, under h.mu
+	wants      map[string]bool // every topic asked for (subs among them), under h.mu
 	turnUsers  []string        // guest TURN users issued here, under h.mu
 	rate       *rate
 
@@ -730,6 +733,7 @@ func (h *Hub) serveConn(c *hubConn) {
 			h.sub(c, string(body))
 		case frameUnsub:
 			h.mu.Lock()
+			delete(c.wants, string(body))
 			h.unsubLocked(c, string(body))
 			h.mu.Unlock()
 		case framePub:
@@ -770,13 +774,27 @@ func (h *Hub) serveConn(c *hubConn) {
 	}
 }
 
+// sub records that c wants topic and grants it if allowed now. A topic
+// that isn't allowed yet (the server's own room hasn't opened it, or a
+// guest window isn't open) is granted later, when it becomes allowed, with
+// no new sub frame: see regrantLocked.
 func (h *Hub) sub(c *hubConn, topic string) {
 	if topic == "" || len(topic) > 255 {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if c.subs[topic] || len(c.subs) >= h.lim.TopicsPerConn || !h.allowedLocked(c, topic) {
+	if !c.wants[topic] {
+		if len(c.wants) >= h.lim.TopicsPerConn {
+			return
+		}
+		c.wants[topic] = true
+	}
+	h.grantLocked(c, topic)
+}
+
+func (h *Hub) grantLocked(c *hubConn, topic string) {
+	if c.subs[topic] || !h.allowedLocked(c, topic) {
 		return
 	}
 	c.subs[topic] = true
@@ -786,6 +804,16 @@ func (h *Hub) sub(c *hubConn, topic string) {
 		h.topics[topic] = t
 	}
 	t.remote[c] = true
+}
+
+// regrantLocked grants topic to every connection that asked for it and
+// may have it now.
+func (h *Hub) regrantLocked(topic string) {
+	for c := range h.conns {
+		if c.wants[topic] {
+			h.grantLocked(c, topic)
+		}
+	}
 }
 
 // turnFor is the turn.creds answer: a member's own, or a guest's narrower
@@ -842,6 +870,7 @@ func (c hubLocalCarrier) Join(topic string, deliver func([]byte, netip.AddrPort)
 		h.topics[topic] = t
 	}
 	t.local = append(t.local, l)
+	h.regrantLocked(topic)
 	h.mu.Unlock()
 	if up != nil {
 		go up()
