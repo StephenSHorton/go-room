@@ -6,24 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
-// DefaultBrokers are independent public MQTT brokers; each entry is one
-// client tried over raw TLS first and WebSockets-over-TLS second (some
-// networks block 8883). Messages go out through all of them and are
-// de-duplicated on arrival, so one broker being down or slow changes nothing.
-var DefaultBrokers = [][]string{
-	{"tls://broker.emqx.io:8883", "wss://broker.emqx.io:8084/mqtt"},
-	{"tls://broker.hivemq.com:8883", "wss://broker.hivemq.com:8884/mqtt"},
-}
-
-// DefaultMaxAge drops anything older (or further ahead) than this: a broker
+// DefaultMaxAge drops anything older (or further ahead) than this: a carrier
 // replaying a backlog after a reconnect, or a clock far off.
 const DefaultMaxAge = 2 * time.Minute
 
@@ -55,13 +47,15 @@ func Decode[T any](env Envelope) (T, error) {
 	return v, nil
 }
 
-// Signaler is a live connection to one room: OpenSignal (public brokers) or
-// MemHub.Open (tests). The unexported method keeps implementations inside
-// go-room, because Mesh relies on how they seal, filter and route.
+// Signaler is a live connection to one room over one or more carriers:
+// Open, MemHub.Open (tests) or mqtt.OpenSignal (public brokers). The
+// unexported method keeps implementations inside go-room, because Mesh
+// relies on how they seal, filter and route.
 type Signaler interface {
-	// Send seals and publishes one envelope to member to ("" = everyone).
+	// Send seals one envelope to member to ("" = everyone) and publishes it
+	// on every carrier.
 	Send(to, typ string, body any) error
-	// Connected reports how many brokers are connected right now.
+	// Connected reports how many carriers are up right now.
 	Connected() int
 	// Self is this member's id.
 	Self() string
@@ -75,12 +69,6 @@ type Signaler interface {
 
 // SignalOptions tune a Signaler. The zero value is Toru's behaviour.
 type SignalOptions struct {
-	// Brokers are the broker sets (default DefaultBrokers). Each inner list
-	// is one client's broker URLs, tried in order.
-	Brokers [][]string
-	// ClientPrefix starts each MQTT client id (default "go-room-"). The rest
-	// is random, so the member id never reaches the broker.
-	ClientPrefix string
 	// MaxAge drops envelopes older or further ahead than this (default
 	// DefaultMaxAge).
 	MaxAge time.Duration
@@ -88,9 +76,40 @@ type SignalOptions struct {
 	// or to self, that isn't one of Mesh's own rtc.* types. It runs on the
 	// signaler's receive goroutine; don't block it for long.
 	OnMsg func(Envelope)
-	// OnConnect fires whenever a broker (re)connects, so callers can announce
-	// themselves.
+	// OnConnect fires whenever a carrier (re)connects, so callers can
+	// announce themselves.
 	OnConnect func()
+	// OnHeard, when set, gets the sender and source address of every
+	// authentic envelope that arrived with one (the LAN carrier), duplicates
+	// included: how an app learns where a member is on the local network.
+	// It runs on the carrier's receive goroutine.
+	OnHeard func(from string, addr netip.AddrPort)
+}
+
+// A Carrier moves sealed payloads for topics. It never holds a key: Open
+// seals, opens, filters and de-duplicates, so every carrier gets the same
+// checks. A Carrier may serve many rooms at once.
+type Carrier interface {
+	// Join starts carrying topic. deliver gets every payload that arrives
+	// for it, with the address it came from when the carrier knows one (the
+	// zero AddrPort otherwise); up runs each time the leg (re)connects.
+	// Neither may block for long.
+	Join(topic string, deliver func(payload []byte, from netip.AddrPort), up func()) (Leg, error)
+}
+
+// A Leg is one topic on one Carrier.
+type Leg interface {
+	// Publish sends one sealed payload. to is the member it is for ("" =
+	// everyone); a carrier may ignore it (a hub or a broker sends to every
+	// subscriber), and the LAN carrier unicasts when it knows the address.
+	Publish(to string, payload []byte) error
+	// Seen tells the leg that a payload it delivered from addr opened as an
+	// authentic envelope from member.
+	Seen(member string, from netip.AddrPort)
+	// Up reports whether the leg can publish right now.
+	Up() bool
+	// Close stops carrying the topic.
+	Close()
 }
 
 // sigCore is the part of every Signaler that doesn't care how bytes move:
@@ -101,6 +120,7 @@ type sigCore struct {
 	topic  string
 	maxAge time.Duration
 	onMsg  func(Envelope)
+	heard  func(string, netip.AddrPort)
 	now    func() time.Time
 
 	mu     sync.Mutex
@@ -120,7 +140,7 @@ func newCore(s Secret, self string, o SignalOptions) (*sigCore, error) {
 	if maxAge <= 0 {
 		maxAge = DefaultMaxAge
 	}
-	return &sigCore{self: self, key: s.Key, topic: s.Topic, maxAge: maxAge, onMsg: o.OnMsg, now: time.Now, seen: map[string]time.Time{}}, nil
+	return &sigCore{self: self, key: s.Key, topic: s.Topic, maxAge: maxAge, onMsg: o.OnMsg, heard: o.OnHeard, now: time.Now, seen: map[string]time.Time{}}, nil
 }
 
 // seal builds and seals one envelope.
@@ -172,10 +192,23 @@ func (c *sigCore) open(payload []byte) (Envelope, bool) {
 }
 
 // receive opens, checks, de-duplicates and routes one payload.
-func (c *sigCore) receive(payload []byte) {
+func (c *sigCore) receive(payload []byte) { c.receiveFrom(payload, nil, netip.AddrPort{}) }
+
+// receiveFrom is receive for a payload leg delivered from addr: an authentic
+// one is reported to the leg (and OnHeard) before de-duplication, so a
+// carrier learns every path a member is heard on, not only the fastest.
+func (c *sigCore) receiveFrom(payload []byte, leg Leg, from netip.AddrPort) {
 	env, ok := c.open(payload)
 	if !ok {
 		return
+	}
+	if from.IsValid() {
+		if leg != nil {
+			leg.Seen(env.From, from)
+		}
+		if c.heard != nil && !c.isClosed() {
+			c.heard(env.From, from)
+		}
 	}
 	now := c.now()
 	c.mu.Lock()
@@ -232,79 +265,79 @@ func (c *sigCore) isClosed() bool {
 	return c.closed
 }
 
-// --- MQTT ---------------------------------------------------------------
+// --- Open: one Signaler over many carriers --------------------------------
 
-type mqttSignal struct {
+type signal struct {
 	c         *sigCore
-	clients   []mqtt.Client
+	legs      []Leg
 	onConnect func()
+	once      sync.Once
 }
 
-// OpenSignal joins the room for s as member self over the public brokers. It
-// returns at once; brokers connect (and reconnect) in the background.
-func OpenSignal(s Secret, self string, o SignalOptions) (Signaler, error) {
+// Open joins the room for s as member self over every carrier given. Each
+// envelope is sealed once and published on all of them, and the first copy
+// to arrive wins (the rest are dropped by id), so one carrier being down or
+// slow changes nothing. It returns at once; carriers connect (and
+// reconnect) in the background, and OnConnect fires on each.
+func Open(s Secret, self string, o SignalOptions, carriers ...Carrier) (Signaler, error) {
 	c, err := newCore(s, self, o)
 	if err != nil {
 		return nil, err
 	}
-	brokers := o.Brokers
-	if len(brokers) == 0 {
-		brokers = DefaultBrokers
+	if len(carriers) == 0 {
+		return nil, errors.New("room: no carriers")
 	}
-	prefix := o.ClientPrefix
-	if prefix == "" {
-		prefix = "go-room-"
+	r := &signal{c: c, onConnect: o.OnConnect}
+	up := func() {
+		if r.onConnect != nil && !c.isClosed() {
+			go r.onConnect()
+		}
 	}
-	r := &mqttSignal{c: c, onConnect: o.OnConnect}
-	for _, set := range brokers {
-		if len(set) == 0 {
+	for _, car := range carriers {
+		if car == nil {
 			continue
 		}
-		opts := mqtt.NewClientOptions().
-			SetClientID(prefix + randHex(8)).
-			SetCleanSession(true).
-			SetAutoReconnect(true).
-			SetConnectRetry(true).
-			SetConnectRetryInterval(3 * time.Second).
-			SetMaxReconnectInterval(15 * time.Second).
-			SetConnectTimeout(8 * time.Second).
-			SetKeepAlive(30 * time.Second).
-			SetOrderMatters(false)
-		for _, b := range set {
-			opts.AddBroker(b)
-		}
-		opts.SetOnConnectHandler(func(cl mqtt.Client) {
-			// Clean sessions forget subscriptions, so (re)subscribe on every connect.
-			cl.Subscribe(c.topic, 1, func(_ mqtt.Client, m mqtt.Message) { c.receive(m.Payload()) })
-			if r.onConnect != nil && !c.isClosed() {
-				go r.onConnect()
+		// A carrier may deliver before Join returns; until then the leg
+		// isn't told what it carried (Seen), which costs nothing.
+		var leg atomic.Pointer[Leg]
+		l, err := car.Join(c.topic, func(p []byte, from netip.AddrPort) {
+			var lg Leg
+			if lp := leg.Load(); lp != nil {
+				lg = *lp
 			}
-		})
-		cl := mqtt.NewClient(opts)
-		cl.Connect() // with ConnectRetry this keeps trying in the background
-		r.clients = append(r.clients, cl)
+			c.receiveFrom(p, lg, from)
+		}, up)
+		if err != nil {
+			r.closeLegs()
+			return nil, err
+		}
+		leg.Store(&l)
+		r.legs = append(r.legs, l)
 	}
-	if len(r.clients) == 0 {
-		return nil, errors.New("room: no brokers")
+	if len(r.legs) == 0 {
+		return nil, errors.New("room: no carriers")
 	}
 	return r, nil
 }
 
-func (r *mqttSignal) core() *sigCore { return r.c }
-func (r *mqttSignal) Self() string   { return r.c.self }
-func (r *mqttSignal) Topic() string  { return r.c.topic }
+func (r *signal) core() *sigCore { return r.c }
+func (r *signal) Self() string   { return r.c.self }
+func (r *signal) Topic() string  { return r.c.topic }
 
-func (r *mqttSignal) Connected() int {
+func (r *signal) Connected() int {
+	if r.c.isClosed() {
+		return 0
+	}
 	n := 0
-	for _, cl := range r.clients {
-		if cl.IsConnectionOpen() {
+	for _, l := range r.legs {
+		if l.Up() {
 			n++
 		}
 	}
 	return n
 }
 
-func (r *mqttSignal) Send(to, typ string, body any) error {
+func (r *signal) Send(to, typ string, body any) error {
 	if r.c.isClosed() {
 		return ErrClosed
 	}
@@ -313,36 +346,47 @@ func (r *mqttSignal) Send(to, typ string, body any) error {
 		return err
 	}
 	sent := 0
-	for _, cl := range r.clients {
-		if !cl.IsConnectionOpen() {
+	var last error
+	for _, l := range r.legs {
+		if !l.Up() {
 			continue
 		}
-		cl.Publish(r.c.topic, 1, false, sealed)
+		if err := l.Publish(to, sealed); err != nil {
+			last = err
+			continue
+		}
 		sent++
 	}
 	if sent == 0 {
+		if last != nil {
+			return last
+		}
 		return ErrNotConnected
 	}
 	return nil
 }
 
-// Close leaves the room. Pending messages get a moment to flush.
-func (r *mqttSignal) Close() {
-	if !r.c.close() {
-		return
-	}
+// Close leaves the room on every carrier.
+func (r *signal) Close() {
+	r.once.Do(func() {
+		r.c.close()
+		r.closeLegs()
+	})
+}
+
+func (r *signal) closeLegs() {
 	var wg sync.WaitGroup
-	for _, cl := range r.clients {
+	for _, l := range r.legs {
 		wg.Add(1)
-		go func(cl mqtt.Client) {
+		go func(l Leg) {
 			defer wg.Done()
-			cl.Disconnect(250)
-		}(cl)
+			l.Close()
+		}(l)
 	}
 	wg.Wait()
 }
 
-// ErrNotConnected is Send's error while no broker is connected.
+// ErrNotConnected is Send's error while no carrier is up.
 var ErrNotConnected = errors.New("not connected to the room yet")
 
 // ErrClosed is returned by anything used after Close.

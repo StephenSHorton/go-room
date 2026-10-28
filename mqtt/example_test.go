@@ -1,4 +1,4 @@
-package room_test
+package mqtt_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"log"
 
 	room "github.com/StephenSHorton/go-room"
+	"github.com/StephenSHorton/go-room/mqtt"
 )
 
 // Two copies of an app meet in a room named by a code one of them showed,
@@ -27,8 +28,7 @@ func Example() {
 	// these with a mutex or channel.)
 	var sig room.Signaler
 	var mesh *room.Mesh
-	sig, err = room.OpenSignal(secret, self, room.SignalOptions{
-		ClientPrefix: "myapp-",
+	sig, err = mqtt.OpenSignal(secret, self, room.SignalOptions{
 		OnConnect: func() {
 			if sig != nil {
 				_ = sig.Send("", "hello", nil)
@@ -39,7 +39,7 @@ func Example() {
 				mesh.Connect(env.From)
 			}
 		},
-	})
+	}, mqtt.Options{ClientPrefix: "myapp-"})
 	if err != nil {
 		log.Fatal(err)
 	}
