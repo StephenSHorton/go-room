@@ -238,7 +238,7 @@ func TestMeshReplaceMakeBeforeBreak(t *testing.T) {
 	a.mesh.mu.Unlock()
 	a.mesh.Connect(b.id)
 
-	if err := waitDown(t, b); !errors.Is(err, errReplaced) {
+	if err := waitDown(t, b); !errors.Is(err, ErrReplaced) {
 		t.Fatalf("b's old peer: %v", err)
 	}
 	pb2 := waitUp(t, b)

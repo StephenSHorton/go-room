@@ -39,9 +39,10 @@ const (
 	autoTries = 6
 )
 
-// errReplaced is why an up peer went down when a newer connection to the
-// same member came up in its place.
-var errReplaced = errors.New("room: replaced by a new connection")
+// ErrReplaced is why an up peer went down (OnPeerDown) when a newer
+// connection to the same member came up in its place: OnPeer for the new
+// one follows. Mesh doesn't reconnect after it; there is nothing to fix.
+var ErrReplaced = errors.New("room: replaced by a new connection")
 
 // Identity is this member's long-term ed25519 key, as a public key and a
 // signing function, so the private key can stay wherever the app keeps it.
@@ -215,7 +216,7 @@ func (m *Mesh) OnPeer(fn func(*Peer)) {
 // reconnect on its own for about a minute; after a Close, a bye or a
 // refusal it doesn't. Apps still call Connect when they see the peer again.
 // When a newer connection replaces an up one, OnPeerDown for the old *Peer
-// (err "replaced by a new connection") comes just before OnPeer for the new.
+// (ErrReplaced) comes just before OnPeer for the new one.
 func (m *Mesh) OnPeerDown(fn func(peer string, err error)) {
 	m.mu.Lock()
 	m.onDown = fn
@@ -551,7 +552,7 @@ func autoReconnect(err error) bool {
 	var local *LocalCloseError
 	var bye *ByeError
 	switch {
-	case err == nil, errors.Is(err, ErrClosed), errors.Is(err, errReplaced),
+	case err == nil, errors.Is(err, ErrClosed), errors.Is(err, ErrReplaced),
 		errors.Is(err, ErrRefused), errors.Is(err, errRefusedHere),
 		errors.As(err, &local), errors.As(err, &bye):
 		return false
@@ -612,7 +613,7 @@ func (m *Mesh) peerUp(p *Peer) {
 	fn := m.onPeer
 	m.mu.Unlock()
 	if old != nil {
-		old.close(errReplaced, false, "") // queues OnPeerDown(old) first
+		old.close(ErrReplaced, false, "") // queues OnPeerDown(old) first
 	}
 	if fn != nil {
 		m.emit(func() { fn(p) })
