@@ -27,15 +27,17 @@ const (
 // ErrTooBig is returned for a message over the channel's cap.
 var ErrTooBig = errors.New("room: message too big")
 
-// flow is the high/low-water wait every writer shares.
+// flow is the high/low-water wait every writer shares. stop ends a wait
+// (the channel is closing); done also ends a drain (it is gone).
 type flow struct {
 	dc   *datachannel.DataChannel
 	low  chan struct{}
+	stop <-chan struct{}
 	done <-chan struct{}
 }
 
-func newFlow(dc *datachannel.DataChannel, done <-chan struct{}) *flow {
-	f := &flow{dc: dc, low: make(chan struct{}, 1), done: done}
+func newFlow(dc *datachannel.DataChannel, stop, done <-chan struct{}) *flow {
+	f := &flow{dc: dc, low: make(chan struct{}, 1), stop: stop, done: done}
 	dc.SetBufferedAmountLowThreshold(lowWater)
 	dc.OnBufferedAmountLow(func() {
 		select {
@@ -53,6 +55,8 @@ func (f *flow) wait(ctx context.Context) error {
 		case <-f.low:
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-f.stop:
+			return ErrClosed
 		case <-f.done:
 			return ErrClosed
 		case <-time.After(50 * time.Millisecond): // belt and braces for a missed event
@@ -62,7 +66,8 @@ func (f *flow) wait(ctx context.Context) error {
 }
 
 // drain waits until everything written has left the send buffer (or ctx
-// ends), so a Close right after the last Write doesn't race the data.
+// ends, or the channel is gone), so a Close right after the last Write
+// doesn't race the data.
 func (f *flow) drain(ctx context.Context) {
 	for f.dc.BufferedAmount() > 0 {
 		select {
@@ -94,7 +99,7 @@ type Channel struct {
 
 func newChannel(dc *datachannel.DataChannel, maxMsg int, fail func(error)) *Channel {
 	c := &Channel{dc: dc, max: maxMsg, fail: fail, in: make(chan []byte, 16), done: make(chan struct{})}
-	c.f = newFlow(dc, c.done)
+	c.f = newFlow(dc, c.done, c.done)
 	go c.readLoop()
 	return c
 }
@@ -238,9 +243,11 @@ func (c *Channel) closedErr() error {
 // Peer.OpenStream or received through Peer.OnStream. Writes go out in 16 KiB
 // pieces under the same flow control as Channel. Close flushes what was
 // written, then closes the channel; the other side's Read returns io.EOF.
-// When the peer goes down, Read usually returns the peer's error instead,
-// but a connection that dies at the wrong moment can still look like
-// io.EOF: check lengths or hashes before trusting a stream as complete.
+// Close also unblocks a Write stuck on a reader that stopped reading (that
+// Write returns ErrClosed, and Close then skips the flush). When the peer
+// goes down, Read usually returns the peer's error instead, but a
+// connection that dies at the wrong moment can still look like io.EOF:
+// check lengths or hashes before trusting a stream as complete.
 type Stream struct {
 	label   string
 	dc      *datachannel.DataChannel
@@ -251,15 +258,20 @@ type Stream struct {
 	rbuf []byte
 	rest []byte
 
-	wmu      sync.Mutex
-	done     chan struct{}
-	once     sync.Once
+	wmu     sync.Mutex
+	cut     bool          // a Write was stopped by closing; under wmu
+	closing chan struct{} // closed first by Close and abort: stops writers
+	stopped sync.Once
+	done    chan struct{} // closed once the channel is closed
+	once    sync.Once
+
+	mu       sync.Mutex
 	abortErr error // set before done closes when the peer went away
 }
 
 func newStream(label string, dc *datachannel.DataChannel, release func()) *Stream {
-	s := &Stream{label: label, dc: dc, release: release, done: make(chan struct{})}
-	s.f = newFlow(dc, s.done)
+	s := &Stream{label: label, dc: dc, release: release, closing: make(chan struct{}), done: make(chan struct{})}
+	s.f = newFlow(dc, s.closing, s.done)
 	return s
 }
 
@@ -278,8 +290,11 @@ func (s *Stream) Read(p []byte) (int, error) {
 		if err != nil {
 			select {
 			case <-s.done:
-				if s.abortErr != nil {
-					return 0, s.abortErr
+				s.mu.Lock()
+				aerr := s.abortErr
+				s.mu.Unlock()
+				if aerr != nil {
+					return 0, aerr
 				}
 				return 0, io.EOF
 			default:
@@ -296,13 +311,29 @@ func (s *Stream) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Write writes all of p, blocking while the channel is backed up.
+// Write writes all of p, blocking while the channel is backed up. Close (or
+// the peer going down) ends a blocked Write with ErrClosed.
 func (s *Stream) Write(p []byte) (int, error) {
+	return s.WriteContext(context.Background(), p)
+}
+
+// WriteContext is Write that also gives up when ctx ends. What was written
+// before that stays written; the stream stays usable.
+func (s *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	written := 0
 	for len(p) > 0 {
-		if err := s.f.wait(context.Background()); err != nil {
+		select {
+		case <-s.closing:
+			s.cut = true
+			return written, ErrClosed
+		default:
+		}
+		if err := s.f.wait(ctx); err != nil {
+			if errors.Is(err, ErrClosed) {
+				s.cut = true
+			}
 			return written, err
 		}
 		n := min(len(p), chunkSize)
@@ -315,36 +346,46 @@ func (s *Stream) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-// Close flushes what was written (up to 30 s) and closes the stream.
+// Close flushes what was written (up to 30 s) and closes the stream. If it
+// had to stop a blocked Write, it doesn't flush: the data is cut anyway.
 func (s *Stream) Close() error {
-	var err error
-	s.once.Do(func() {
-		s.wmu.Lock()
+	s.stopped.Do(func() { close(s.closing) })
+	s.wmu.Lock()
+	cut := s.cut
+	s.cut = true // later Writes return ErrClosed; nothing more to flush
+	if !cut {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		s.f.drain(ctx)
 		cancel()
-		s.wmu.Unlock()
-		close(s.done)
-		err = s.dc.Close()
-		if s.release != nil {
-			s.release()
-		}
-	})
-	return err
+	}
+	s.wmu.Unlock()
+	return s.finish(nil)
 }
 
 // abort closes the stream without flushing (its peer went away); a Read
-// after it returns err rather than io.EOF.
+// after it returns err rather than io.EOF. It never waits on a writer.
 func (s *Stream) abort(err error) {
+	if err == nil {
+		err = ErrClosed
+	}
+	s.stopped.Do(func() { close(s.closing) })
+	_ = s.finish(err)
+}
+
+// finish closes the channel once. err is the abort reason (nil for Close).
+func (s *Stream) finish(err error) error {
+	var cerr error
 	s.once.Do(func() {
-		if err == nil {
-			err = ErrClosed
+		if err != nil {
+			s.mu.Lock()
+			s.abortErr = err
+			s.mu.Unlock()
 		}
-		s.abortErr = err
 		close(s.done)
-		_ = s.dc.Close()
+		cerr = s.dc.Close()
 		if s.release != nil {
 			s.release()
 		}
 	})
+	return cerr
 }

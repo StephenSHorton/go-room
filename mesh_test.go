@@ -234,11 +234,11 @@ func TestMeshEndToEnd(t *testing.T) {
 	exchange(t, ctx, pa2, pb2)
 
 	// Reconnect 2: the connection dies with no bye (as when a machine
-	// vanishes). Both sides notice; the offerer's Connect brings it back.
+	// vanishes). Both sides notice, and Mesh reconnects on its own: no
+	// Connect from the app.
 	_ = pa2.pc.Close()
 	waitDown(t, a)
 	waitDown(t, b)
-	a.mesh.Connect(b.id)
 	pa3 := waitUp(t, a)
 	pb3 := waitUp(t, b)
 	exchange(t, ctx, pa3, pb3)

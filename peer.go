@@ -41,6 +41,10 @@ type Peer struct {
 	fpLocal  []byte
 	fpRemote []byte
 	msgs     *Channel
+	offerAt  int64  // answerer: the offer envelope's At (the offerer's clock)
+	token    string // sent in this side's auth; a bye to an up peer must carry it
+	theirTok string // the peer's auth token, put in this side's byes
+	shown    bool   // under m.mu: OnPeer was queued for it
 
 	mu       sync.Mutex
 	state    int
@@ -98,6 +102,19 @@ func (p *Peer) Path() string {
 		return "relay"
 	}
 	return "direct"
+}
+
+// healthy reports whether ICE still hears the peer (consent checks are
+// authenticated by ICE, so signaling can't fake this).
+func (p *Peer) healthy() bool {
+	if p.pc == nil {
+		return false
+	}
+	switch p.pc.ICEConnectionState() {
+	case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted:
+		return true
+	}
+	return false
 }
 
 // RTT is the latest ICE round-trip time on the nominated pair (0 if none
@@ -311,7 +328,11 @@ func (p *Peer) setAnswer(sdp string) {
 	p.answered = true
 	p.mu.Unlock()
 	if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}); err != nil {
-		p.close(fmt.Errorf("room: bad answer: %w", err), true, "bad answer")
+		// Maybe a forged answer that raced the real one: wait for another.
+		p.m.cfg.Logf("room: bad answer from %s: %v", p.id, err)
+		p.mu.Lock()
+		p.answered = false
+		p.mu.Unlock()
 	}
 }
 
@@ -392,7 +413,10 @@ func (p *Peer) syncOpen(dc *webrtc.DataChannel) {
 // incoming takes a stream the peer opened.
 func (p *Peer) incoming(label string, dc *datachannel.DataChannel) {
 	p.mu.Lock()
-	if p.state == stateClosed || p.inCount >= p.m.cfg.MaxStreams || label == "" || label == SyncLabel {
+	// Twice the opener's cap: the opener frees its slot on its own Close,
+	// this side only when the handler closes, so for a moment both a
+	// finishing stream and its successor are here.
+	if p.state == stateClosed || p.inCount >= 2*p.m.cfg.MaxStreams || label == "" || label == SyncLabel {
 		p.mu.Unlock()
 		_ = dc.Close()
 		return
@@ -439,7 +463,7 @@ func (p *Peer) close(err error, bye bool, reason string) {
 		if p.timer != nil {
 			p.timer.Stop()
 		}
-		p.m.forget(p, wasUp)
+		shown := p.m.forget(p, wasUp, err)
 		if msgs != nil {
 			msgs.close(err)
 		}
@@ -447,7 +471,9 @@ func (p *Peer) close(err error, bye bool, reason string) {
 			s.abort(err)
 		}
 		if bye {
-			_ = p.m.sig.Send(p.id, MsgBye, byeBody{Session: p.session, Reason: reason})
+			// The token is the peer's own, from its auth (inside DTLS):
+			// only this side can prove the bye is real.
+			_ = p.m.sig.Send(p.id, MsgBye, byeBody{Session: p.session, Token: p.theirTok, Reason: reason})
 		}
 		go func() {
 			defer p.m.pcs.Done()
@@ -455,7 +481,7 @@ func (p *Peer) close(err error, bye bool, reason string) {
 				_ = pc.Close()
 			}
 		}()
-		if wasUp {
+		if shown {
 			p.m.peerDown(p.id, err)
 		}
 	})

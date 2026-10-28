@@ -31,10 +31,17 @@ const (
 	DefaultConnectTimeout = 30 * time.Second
 	gatherCap             = 4 * time.Second // send what we have; host candidates come first
 	wantEvery             = time.Second     // at most one rtc.want per peer per this
-	staleUp               = 10 * time.Second
 	backoffMin            = time.Second
 	backoffMax            = 60 * time.Second
+	// autoTries is how many reconnect attempts Mesh makes on its own after
+	// an up peer drops (1 s, 2 s, 4 s ... apart, about a minute in all).
+	// After that it is the app's Connect again.
+	autoTries = 6
 )
+
+// errReplaced is why an up peer went down when a newer connection to the
+// same member came up in its place.
+var errReplaced = errors.New("room: replaced by a new connection")
 
 // Identity is this member's long-term ed25519 key, as a public key and a
 // signing function, so the private key can stay wherever the app keeps it.
@@ -78,9 +85,12 @@ type Config struct {
 	Tune func(*webrtc.SettingEngine)
 	// MaxMessage caps one Channel message, both ways (default 4 MiB).
 	MaxMessage int
-	// MaxStreams caps concurrent streams per peer in each direction (default
-	// 4). OpenStream waits for a free slot; an incoming stream over the cap is
-	// closed at once.
+	// MaxStreams caps the streams this side opens to one peer at a time
+	// (default 4): OpenStream waits for a free slot. Incoming streams may run
+	// to twice this, because the opener frees a slot on its own Close while
+	// this side frees it only when its handler closes the stream; past that,
+	// an incoming stream is closed at once (the opener reads io.EOF). Both
+	// sides should use the same value.
 	MaxStreams int
 	// AuthTimeout bounds the handshake once the data channel is open
 	// (default 10 s); ConnectTimeout bounds a whole attempt (default 30 s).
@@ -101,7 +111,9 @@ type Mesh struct {
 
 	mu      sync.Mutex
 	peers   map[string]*Peer // the current attempt or connection per peer
+	next    map[string]*Peer // answerer: a newer attempt waiting to replace an up peer
 	retry   map[string]*retryState
+	auto    map[string]*autoState
 	wantAt  map[string]time.Time
 	onPeer  func(*Peer)
 	onDown  func(string, error)
@@ -112,6 +124,13 @@ type Mesh struct {
 	evWake  chan struct{}
 	evDone  chan struct{}
 	evClose chan struct{}
+}
+
+// autoState is Mesh's own reconnecting after an up peer dropped.
+type autoState struct {
+	left    int
+	backoff time.Duration
+	timer   *time.Timer
 }
 
 type retryState struct {
@@ -169,7 +188,9 @@ func NewMesh(sig Signaler, cfg Config) (*Mesh, error) {
 		cfg:     cfg,
 		api:     webrtc.NewAPI(webrtc.WithSettingEngine(se)),
 		peers:   map[string]*Peer{},
+		next:    map[string]*Peer{},
 		retry:   map[string]*retryState{},
+		auto:    map[string]*autoState{},
 		wantAt:  map[string]time.Time{},
 		evWake:  make(chan struct{}, 1),
 		evDone:  make(chan struct{}),
@@ -189,7 +210,12 @@ func (m *Mesh) OnPeer(fn func(*Peer)) {
 	m.mu.Unlock()
 }
 
-// OnPeerDown sets the handler for an up peer going away, with why.
+// OnPeerDown sets the handler for an up peer going away, with why. After a
+// drop that neither side asked for (the connection failed), Mesh tries to
+// reconnect on its own for about a minute; after a Close, a bye or a
+// refusal it doesn't. Apps still call Connect when they see the peer again.
+// When a newer connection replaces an up one, OnPeerDown for the old *Peer
+// (err "replaced by a new connection") comes just before OnPeer for the new.
 func (m *Mesh) OnPeerDown(fn func(peer string, err error)) {
 	m.mu.Lock()
 	m.onDown = fn
@@ -275,18 +301,20 @@ func (m *Mesh) Connect(peer string) {
 		}
 	}
 	p := m.newPeerLocked(peer, randHex(8), true)
+	m.peers[peer] = p
 	m.mu.Unlock()
 	go m.offer(p)
 }
 
+// newPeerLocked makes an attempt; the caller files it in peers or next.
 func (m *Mesh) newPeerLocked(id, session string, offerer bool) *Peer {
 	p := &Peer{
 		m: m, id: id, session: session, offerer: offerer,
 		up: make(chan struct{}), done: make(chan struct{}),
 		outSem:  make(chan struct{}, m.cfg.MaxStreams),
 		streams: map[*Stream]struct{}{},
+		token:   randHex(16),
 	}
-	m.peers[id] = p
 	m.pcs.Add(1)
 	p.timer = time.AfterFunc(m.cfg.ConnectTimeout, func() {
 		if !p.isUp() {
@@ -303,6 +331,7 @@ type sdpBody struct {
 
 type byeBody struct {
 	Session string `json:"session"`
+	Token   string `json:"token,omitempty"` // the receiver's auth token, for an up peer
 	Reason  string `json:"reason,omitempty"`
 }
 
@@ -330,6 +359,13 @@ func (m *Mesh) offer(p *Peer) {
 
 // handle takes every rtc.* envelope from the signaler. Anything slow runs on
 // its own goroutine, so the signaler keeps delivering.
+//
+// Envelopes only prove the sender holds the room key, and From is a claim.
+// So none of them can take down an authenticated connection that is still
+// working: a newer offer is answered beside it and replaces it only once it
+// passes the handshake; a want closes it only when ICE has stopped hearing
+// the peer; a bye closes it only when it carries the token this side sent
+// in its auth message, inside DTLS.
 func (m *Mesh) handle(env Envelope) {
 	peer := env.From
 	switch env.Type {
@@ -340,9 +376,12 @@ func (m *Mesh) handle(env Envelope) {
 		m.mu.Lock()
 		p := m.peers[peer]
 		m.mu.Unlock()
-		if p != nil && p.isUp() && time.Since(p.upAt()) > staleUp {
+		if p != nil && p.isUp() {
+			if p.healthy() {
+				return // still hearing it: a stale or forged want
+			}
 			// The other side has no connection to us (it only asks when it
-			// has none), so this one is dead though ICE hasn't noticed yet.
+			// has none) and ICE hasn't heard it lately: this one is dead.
 			p.close(errors.New("room: peer asked for a new connection"), false, "")
 		}
 		m.Connect(peer)
@@ -361,18 +400,35 @@ func (m *Mesh) handle(env Envelope) {
 			m.mu.Unlock()
 			return
 		}
-		old := m.peers[peer]
-		if old != nil && old.session == b.Session {
-			m.mu.Unlock()
-			return
-		}
-		if old != nil {
-			delete(m.peers, peer)
+		cur, nxt := m.peers[peer], m.next[peer]
+		for _, x := range []*Peer{cur, nxt} {
+			// Same session, or not newer on the offerer's clock than the
+			// offer behind an attempt we have (a replay held back by a
+			// broker, or a forger's leftover).
+			if x != nil && (x.session == b.Session || env.At <= x.offerAt) {
+				m.mu.Unlock()
+				return
+			}
 		}
 		p := m.newPeerLocked(peer, b.Session, false)
+		p.offerAt = env.At
+		var drop []*Peer
+		if nxt != nil {
+			delete(m.next, peer)
+			drop = append(drop, nxt)
+		}
+		if cur != nil && cur.isUp() {
+			m.next[peer] = p // make before break
+		} else {
+			if cur != nil {
+				delete(m.peers, peer)
+				drop = append(drop, cur)
+			}
+			m.peers[peer] = p
+		}
 		m.mu.Unlock()
-		if old != nil {
-			old.close(errors.New("room: replaced by a new connection"), false, "")
+		for _, x := range drop {
+			x.close(errors.New("room: superseded by a newer offer"), false, "")
 		}
 		go m.answer(p, b.SDP)
 	case MsgAnswer:
@@ -393,11 +449,20 @@ func (m *Mesh) handle(env Envelope) {
 			return
 		}
 		m.mu.Lock()
-		p := m.peers[peer]
-		m.mu.Unlock()
-		if p != nil && p.session == b.Session {
-			go p.close(&ByeError{Reason: b.Reason}, false, "")
+		var target *Peer
+		for _, x := range []*Peer{m.peers[peer], m.next[peer]} {
+			if x != nil && x.session == b.Session {
+				target = x
+			}
 		}
+		m.mu.Unlock()
+		if target == nil {
+			return
+		}
+		if target.isUp() && b.Token != target.token {
+			return // anyone in the room can read a session id
+		}
+		go target.close(&ByeError{Reason: b.Reason}, false, "")
 	}
 }
 
@@ -435,42 +500,120 @@ func (e *ByeError) Error() string {
 	return "room: closed by peer: " + e.Reason
 }
 
-// forget drops p from the mesh and keeps the offerer's backoff.
-func (m *Mesh) forget(p *Peer, wasUp bool) {
+// forget drops p from the mesh, keeps the offerer's backoff and starts or
+// continues Mesh's own reconnecting. It reports whether the app saw p up,
+// so it should hear that p went down.
+func (m *Mesh) forget(p *Peer, wasUp bool, err error) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.peers[p.id] == p {
-		delete(m.peers, p.id)
-		// The next Connect may ask again at once.
-		delete(m.wantAt, p.id)
+	if m.next[p.id] == p {
+		delete(m.next, p.id)
+		return p.shown // a replacement that didn't make it; the up peer stays
 	}
-	if !p.offerer {
-		return
+	if m.peers[p.id] != p {
+		return p.shown // already replaced
+	}
+	delete(m.peers, p.id)
+	// The next Connect may ask again at once.
+	delete(m.wantAt, p.id)
+	if p.offerer {
+		if wasUp {
+			if r := m.retry[p.id]; r != nil && r.timer != nil {
+				r.timer.Stop()
+			}
+			delete(m.retry, p.id)
+		} else {
+			r := m.retry[p.id]
+			if r == nil {
+				r = &retryState{}
+				m.retry[p.id] = r
+			}
+			r.backoff = min(max(r.backoff*2, backoffMin), backoffMax)
+			r.next = time.Now().Add(r.backoff)
+		}
 	}
 	if wasUp {
-		if r := m.retry[p.id]; r != nil && r.timer != nil {
-			r.timer.Stop()
+		if a := m.auto[p.id]; a != nil && a.timer != nil {
+			a.timer.Stop()
 		}
-		delete(m.retry, p.id)
+		delete(m.auto, p.id)
+		if autoReconnect(err) {
+			m.auto[p.id] = &autoState{left: autoTries}
+		}
+	}
+	m.autoKickLocked(p.id)
+	return p.shown
+}
+
+// autoReconnect is whether a drop with err is one Mesh retries by itself:
+// the connection failed, rather than either side choosing to end it.
+func autoReconnect(err error) bool {
+	var local *LocalCloseError
+	var bye *ByeError
+	switch {
+	case err == nil, errors.Is(err, ErrClosed), errors.Is(err, errReplaced),
+		errors.Is(err, ErrRefused), errors.Is(err, errRefusedHere),
+		errors.As(err, &local), errors.As(err, &bye):
+		return false
+	}
+	return true
+}
+
+// autoKickLocked schedules the next of Mesh's own reconnect attempts to
+// peer, if it is reconnecting and nothing is scheduled or running.
+func (m *Mesh) autoKickLocked(peer string) {
+	a := m.auto[peer]
+	if a == nil || a.timer != nil || m.closed || m.peers[peer] != nil {
 		return
 	}
-	r := m.retry[p.id]
-	if r == nil {
-		r = &retryState{}
-		m.retry[p.id] = r
+	if a.left <= 0 {
+		delete(m.auto, peer)
+		return
 	}
-	r.backoff = min(max(r.backoff*2, backoffMin), backoffMax)
-	r.next = time.Now().Add(r.backoff)
+	a.left--
+	a.backoff = min(max(a.backoff*2, backoffMin), backoffMax)
+	a.timer = time.AfterFunc(a.backoff, func() {
+		m.mu.Lock()
+		if m.auto[peer] != a || m.closed {
+			m.mu.Unlock()
+			return
+		}
+		a.timer = nil
+		m.mu.Unlock()
+		m.Connect(peer)
+		// A want may get no reply at all (the offerer is gone, or still
+		// hears its old connection); an offer that fails lands in forget.
+		m.mu.Lock()
+		m.autoKickLocked(peer)
+		m.mu.Unlock()
+	})
 }
 
 func (m *Mesh) peerUp(p *Peer) {
 	m.mu.Lock()
+	var old *Peer
+	if m.next[p.id] == p {
+		delete(m.next, p.id)
+		old = m.peers[p.id]
+		m.peers[p.id] = p
+	} else if m.peers[p.id] != p {
+		m.mu.Unlock()
+		return // closed meanwhile
+	}
 	if r := m.retry[p.id]; r != nil && r.timer != nil {
 		r.timer.Stop()
 	}
 	delete(m.retry, p.id)
+	if a := m.auto[p.id]; a != nil && a.timer != nil {
+		a.timer.Stop()
+	}
+	delete(m.auto, p.id)
+	p.shown = true
 	fn := m.onPeer
 	m.mu.Unlock()
+	if old != nil {
+		old.close(errReplaced, false, "") // queues OnPeerDown(old) first
+	}
 	if fn != nil {
 		m.emit(func() { fn(p) })
 	}
@@ -531,9 +674,17 @@ func (m *Mesh) Close() {
 	for _, p := range m.peers {
 		all = append(all, p)
 	}
+	for _, p := range m.next {
+		all = append(all, p)
+	}
 	for _, r := range m.retry {
 		if r.timer != nil {
 			r.timer.Stop()
+		}
+	}
+	for _, a := range m.auto {
+		if a.timer != nil {
+			a.timer.Stop()
 		}
 	}
 	m.mu.Unlock()
@@ -555,6 +706,9 @@ type authMsg struct {
 	DeviceID  string `json:"deviceId"`
 	DevicePub string `json:"devicePub"` // hex
 	Sig       string `json:"sig"`       // hex
+	// Token is random per connection. It travels only inside DTLS, so a bye
+	// that carries it really comes from the peer (see byeBody).
+	Token string `json:"token"`
 }
 
 type authResult struct {
@@ -603,7 +757,7 @@ func (p *Peer) handshake(ctx context.Context) error {
 		fpO, fpA = p.fpRemote, p.fpLocal
 	}
 	sig := m.cfg.Identity.Sign(authPayload(p.offerer, fpO, fpA, m.topicHash, m.cfg.Self))
-	mine := authMsg{V: 1, DeviceID: m.cfg.Self, DevicePub: hexs(m.cfg.Identity.Pub), Sig: hexs(sig)}
+	mine := authMsg{V: 1, DeviceID: m.cfg.Self, DevicePub: hexs(m.cfg.Identity.Pub), Sig: hexs(sig), Token: p.token}
 	if err := p.msgs.Send(ctx, marshal(mine)); err != nil {
 		return err
 	}
@@ -627,6 +781,7 @@ func (p *Peer) handshake(ctx context.Context) error {
 		return errors.New("room: auth signature doesn't verify")
 	}
 	p.pub = ed25519.PublicKey(pub)
+	p.theirTok = theirs.Token
 	verdict := m.cfg.Accept(p.id, p.pub)
 	res := authResult{V: 1, OK: verdict == nil}
 	if verdict != nil {
