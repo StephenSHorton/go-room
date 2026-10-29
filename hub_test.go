@@ -57,6 +57,12 @@ func listenLoopback(t *testing.T) net.Listener {
 
 func newTestHub(t *testing.T, edit func(*HubConfig)) *testHub {
 	t.Helper()
+	return newTestHubOn(t, listenLoopback(t), edit)
+}
+
+// newTestHubOn is newTestHub serving on ln (the hub's half of SplitTCP).
+func newTestHubOn(t *testing.T, ln net.Listener, edit func(*HubConfig)) *testHub {
+	t.Helper()
 	pub, key, _ := ed25519.GenerateKey(rand.Reader)
 	th := &testHub{pub: pub, members: map[string]ed25519.PublicKey{}}
 	cfg := HubConfig{
@@ -80,7 +86,6 @@ func newTestHub(t *testing.T, edit func(*HubConfig)) *testHub {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln := listenLoopback(t)
 	go func() { _ = h.Serve(ln) }()
 	t.Cleanup(h.Close)
 	th.hub, th.addr = h, ln.Addr().String()
@@ -92,10 +97,28 @@ func (th *testHub) member(t *testing.T, id string) (*HubClient, ed25519.PrivateK
 	t.Helper()
 	pub, key, _ := ed25519.GenerateKey(rand.Reader)
 	th.certify(id, pub)
-	ident := KeyIdentity(key)
-	c := DialHub(HubDialConfig{Self: id, Identity: &ident, Addrs: func() []string { return []string{th.addr} }, Expect: th.expect, Logf: t.Logf})
-	t.Cleanup(c.Close)
+	c := th.dialAs(t, id, key, nil)
 	return c, key
+}
+
+// memberWith is member with the dial config edited first.
+func (th *testHub) memberWith(t *testing.T, id string, edit func(*HubDialConfig)) *HubClient {
+	t.Helper()
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	th.certify(id, pub)
+	return th.dialAs(t, id, key, edit)
+}
+
+func (th *testHub) dialAs(t *testing.T, id string, key ed25519.PrivateKey, edit func(*HubDialConfig)) *HubClient {
+	t.Helper()
+	ident := KeyIdentity(key)
+	cfg := HubDialConfig{Self: id, Identity: &ident, Addrs: func() []string { return []string{th.addr} }, Expect: th.expect, Logf: t.Logf}
+	if edit != nil {
+		edit(&cfg)
+	}
+	c := DialHub(cfg)
+	t.Cleanup(c.Close)
+	return c
 }
 
 func (th *testHub) guest(t *testing.T, topic string) *HubClient {
