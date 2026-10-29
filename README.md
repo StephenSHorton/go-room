@@ -26,9 +26,9 @@ It was extracted from [Toru](https://github.com/StephenSHorton/toru)'s rooms (`i
 | `Carrier`, `Leg` | What a carrier implements. `Join(topic, deliver, up)` gives a `Leg` with `Publish(to, payload)`, `Seen(member, addr)`, `Up()` and `Close()`. A carrier moves sealed bytes and never holds a key: sealing, filtering, de-duplication and the age check are `Open`'s. |
 | `NewMemHub()` | An in-process fake hub for tests: `Carrier()`, or `Open(...)` as shorthand for `room.Open(..., h.Carrier())`. |
 | `OpenLAN(LANConfig)` | The LAN carrier: one UDP socket on a fixed port (Irori: 38419) for every room. See [LAN](#lan). `NewMemLAN()` is an in-process broadcast domain for tests. |
-| `NewHub(HubConfig)`, `Serve(ln)` | The hub server; see [Home server](#home-server). `Local()` carries the server's own rooms in process. `OpenGuest`, `CloseGuest` and `Drop` manage pairing windows and revokes. |
-| `DialHub(HubDialConfig)` | A hub client. It dials every address it has at once, keeps the first that completes the handshake, and reconnects by itself (1 s doubling to 60 s). `Carrier()`, `Up()`, `Addr()`, `Server()`, `OpenGuest`, `CloseGuest`, `TURN(ctx)`. |
-| `NewTURN(TURNConfig)` | A TURN server on `pion/turn`, with credentials minted by `Issue(user)` and `IssueGuest(until)`. |
+| `NewHub(HubConfig)`, `Serve(ln)` | The hub server; see [Home server](#home-server). `Local()` carries the server's own rooms in process. `OpenGuest`, `OpenInvite`, `CloseGuest` and `Drop` manage pairing and invite windows and revokes; `Recheck` applies `AllowTopic` again after the app's state changes. |
+| `DialHub(HubDialConfig)` | A hub client. It dials every address it has at once, keeps the first that completes the handshake, and reconnects by itself (1 s doubling to 60 s). `Carrier()`, `Up()`, `Addr()`, `Server()`, `OpenGuest`, `OpenInvite`, `CloseGuest`, `TURN(ctx)`. |
+| `NewTURN(TURNConfig)` | A TURN server on `pion/turn`, with credentials minted by `Issue(user)`, `IssueBoard(person)` and `IssueGuest(until)`. |
 | `SplitTCP(ln)` | One TCP port for the hub and TURN over TCP, split by each connection's first byte. |
 | `portmap.Start(Config)` | Router port mapping over UPnP-IGD or NAT-PMP, renewed until `Close` removes it. |
 | `mqtt.OpenSignal(secret, self, opts, mqtt.Options{})` | A room over the public brokers, one carrier per broker set. `mqtt.Carrier` puts them beside other carriers. |
@@ -69,7 +69,8 @@ server = ed25519(device key, "go-room/hub/server/1" || 0x00 || x || len(id) || i
 
 **Who may use which topic.**
 - **Members** may subscribe to the topics `AllowTopic` allows and to open guest topics. By default `AllowTopic` allows the topics the server's own rooms have open through `Local()`.
-- **Guests** are devices pairing with only a code. A guest gets the one topic its `hello` names, and only while a member has it open with `guest.open`: at most 10 minutes, and at most 2 per member.
+- **Board peers** are another person's devices, for a board you share with them. When `Authorize` refuses a device, `AuthorizeBoard(id, pub)` may admit it and name its person (`HubPeer.Person`). A board peer may subscribe only to what `AllowTopic` grants it (nothing when `AllowTopic` is nil), never to a guest topic, may not open guest topics, and gets narrow TURN credentials (below). They have their own connection cap, so they never take your devices' slots. After the state `AllowTopic` reads changes (a board's members or epoch), call `Recheck`; to remove a person, `Drop` each of their devices (`Peers()` lists them with `Person`).
+- **Guests** are devices pairing with only a code. A guest gets the one topic its `hello` names, and only while a member has it open with `guest.open`. A pairing window lasts at most 10 minutes, at most 2 per member. An invite window (`OpenInvite`, `guest.open` with `kind: "invite"`) lasts at most an hour, long enough for a voice call, with 2 more per member. A hub older than v0.3.0 ignores `kind` and closes an invite window after 10 minutes.
 - **The bridge:** `Bridge` carries open guest topics between the server's LAN and the hub, so a new device at home reaches a member away from home.
 - **Closing:** closing a guest topic drops its guests and revokes their TURN credentials. `Drop(id)` closes a revoked member and its guest topics.
 - **Limits** (`HubLimits`): 64 members, 8 guests, 4 handshakes in flight per IP (an IPv6 /64 counts as one) and 64 in all, with a backoff after a failed handshake, 8 topics per connection, 50 `pub` a second. A member's guest topics outlive its last connection by a short grace. The hub keeps nothing.
@@ -78,8 +79,8 @@ server = ed25519(device key, "go-room/hub/server/1" || 0x00 || x || len(id) || i
 - **Credentials** are the TURN REST scheme: `"<expiry>:<handle>"` and `base64(HMAC-SHA1(key, username))`, where a member's handle is its user masked with a keystream from the key and the expiry, so the username names no stable id. The 32-byte key never leaves the server. They last 12 hours and are handed out only over the hub (`turn.get`).
 - **Integrity first:** pion asks the auth handler before it checks MESSAGE-INTEGRITY, so a client's address is learned only from the `OnAuth` event of a verified request.
 - **Revocation:** `Authorize(user)` runs on every authenticated request, allocation refreshes included, so a revoked device loses its relay at its next refresh.
-- **Peers:** by default, members may relay to the server's own private subnets and to relayed addresses on the server. Guests may relay only to relayed addresses. Neither may relay to loopback, link-local, multicast or the internet.
-- **Caps:** 8 allocations per user, 32 in all, 4 across every guest; a revoked guest's allocations close. TURN over TCP takes 64 connections (8 per IP) and closes one that reads nothing for 5 minutes.
+- **Peers:** by default, members may relay to the server's own private subnets and to relayed addresses on the server. Guests may relay only to relayed addresses. Board peers (`IssueBoard`, user `board-<person>`) may relay only to relayed addresses, whatever `AllowPeer` says, so another person never reaches your LAN. None may relay to loopback, link-local, multicast or the internet. `Authorize(user)` sees a board user as `board-<person>`.
+- **Caps:** 8 allocations per user, 32 in all, 4 across every guest, 4 per other person across all of their devices (`MaxBoardPerUser`); a revoked guest's allocations close. TURN over TCP takes 64 connections (8 per IP) and closes one that reads nothing for 5 minutes.
 - There is no `turns:`, because what TURN carries is DTLS already.
 
 **Port mapping** (`go-room/portmap`).
@@ -120,7 +121,7 @@ server = ed25519(device key, "go-room/hub/server/1" || 0x00 || x || len(id) || i
 - a TLS 1.3 server whose certificate has no names and changes at every start, and which says nothing without a valid `hello`;
 - a STUN server that answers Binding with the scanner's own address and refuses Allocate (401, realm `relay`).
 
-It doesn't learn whose server it is, which devices exist, or any topic. A guest topic is open for at most 10 minutes and named by a hash of a pairing code. A certified device can send UDP through TURN to hosts on the server's LAN until it is revoked; that is the price of relaying to LAN devices.
+It doesn't learn whose server it is, which devices exist, or any topic. A guest topic is open for at most 10 minutes (an hour for an invite) and named by a hash of a code. A certified device can send UDP through TURN to hosts on the server's LAN until it is revoked; that is the price of relaying to LAN devices. Another person's device can't: its relay reaches only the server's relayed addresses.
 
 ## Example
 
@@ -165,6 +166,7 @@ More code:
 - `mqtt/example_test.go` is a broker version that compiles.
 - `mesh_test.go` runs two peers in one process over `MemHub` and loopback.
 - `hub_test.go` and `lan_test.go` run the same over a real hub and LAN sockets on 127.0.0.1.
+- `hubboard_test.go` has two people on one hub: one device running two meshes (its own and a board's), the other person's device reaching only the board.
 
 ## Notes
 

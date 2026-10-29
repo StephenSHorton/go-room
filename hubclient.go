@@ -54,6 +54,7 @@ type HubClient struct {
 	upCh    chan struct{} // closed while connected
 	legs    map[string][]*hubClientLeg
 	guests  map[string]time.Time        // guest topics this member opened, until
+	invites map[string]bool             // which of them are invite windows
 	pending map[uint64]chan hubTURNBody // turn.get requests by id
 	nextID  uint64
 	closed  bool
@@ -79,6 +80,7 @@ func DialHub(cfg HubDialConfig) *HubClient {
 		upCh:    make(chan struct{}),
 		legs:    map[string][]*hubClientLeg{},
 		guests:  map[string]time.Time{},
+		invites: map[string]bool{},
 		pending: map[uint64]chan hubTURNBody{},
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -291,20 +293,25 @@ func (c *HubClient) run(tc *tls.Conn, addr string, w hubWelcome) {
 		}
 	}
 	now := time.Now()
-	guests := map[string]time.Duration{}
+	guests := map[string]hubGuestBody{}
 	for t, until := range c.guests {
 		if left := until.Sub(now); left > 0 {
-			guests[t] = left
+			g := hubGuestBody{Topic: t, TTLMs: left.Milliseconds()}
+			if c.invites[t] {
+				g.Kind = GuestInvite
+			}
+			guests[t] = g
 		} else {
 			delete(c.guests, t)
+			delete(c.invites, t)
 		}
 	}
 	close(c.upCh)
 	c.mu.Unlock()
 	c.cfg.Logf("hub: connected to %s at %s", w.ID, addr)
 
-	for t, left := range guests {
-		_ = c.write(frameGuestOpen, marshal(hubGuestBody{Topic: t, TTLMs: left.Milliseconds()}))
+	for _, g := range guests {
+		_ = c.write(frameGuestOpen, marshal(g))
 	}
 	for _, t := range topics {
 		_ = c.write(frameSub, []byte(t))
@@ -418,8 +425,23 @@ func (c *HubClient) waitUp(ctx context.Context) error {
 // (at most MaxGuestTTL). It waits for the connection up to ctx, and is sent
 // again on every reconnect until ttl runs out or CloseGuest.
 func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Duration) error {
-	if ttl <= 0 || ttl > MaxGuestTTL {
-		ttl = MaxGuestTTL
+	return c.openGuest(ctx, topic, ttl, false)
+}
+
+// OpenInvite is OpenGuest for an invite window (a shared board's invite),
+// open for ttl (at most MaxInviteTTL). A hub older than go-room v0.3.0
+// treats it as a pairing window and closes it after MaxGuestTTL.
+func (c *HubClient) OpenInvite(ctx context.Context, topic string, ttl time.Duration) error {
+	return c.openGuest(ctx, topic, ttl, true)
+}
+
+func (c *HubClient) openGuest(ctx context.Context, topic string, ttl time.Duration, invite bool) error {
+	max := MaxGuestTTL
+	if invite {
+		max = MaxInviteTTL
+	}
+	if ttl <= 0 || ttl > max {
+		ttl = max
 	}
 	if c.cfg.Identity == nil {
 		return errors.New("room: a guest can't open guest topics")
@@ -432,6 +454,7 @@ func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Durati
 	// (run), and a CloseGuest meanwhile removes it, so it isn't sent after.
 	c.mu.Lock()
 	c.guests[topic] = until
+	c.invites[topic] = invite
 	c.mu.Unlock()
 	if err := c.waitUp(ctx); err != nil {
 		if ctx.Err() != nil {
@@ -440,6 +463,7 @@ func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Durati
 			c.mu.Lock()
 			if c.guests[topic] == until {
 				delete(c.guests, topic)
+				delete(c.invites, topic)
 			}
 			c.mu.Unlock()
 		}
@@ -451,13 +475,18 @@ func (c *HubClient) OpenGuest(ctx context.Context, topic string, ttl time.Durati
 	if !open {
 		return ErrClosed
 	}
-	return c.write(frameGuestOpen, marshal(hubGuestBody{Topic: topic, TTLMs: time.Until(until).Milliseconds()}))
+	g := hubGuestBody{Topic: topic, TTLMs: time.Until(until).Milliseconds()}
+	if invite {
+		g.Kind = GuestInvite
+	}
+	return c.write(frameGuestOpen, marshal(g))
 }
 
 // CloseGuest closes a guest topic this member opened.
 func (c *HubClient) CloseGuest(topic string) {
 	c.mu.Lock()
 	delete(c.guests, topic)
+	delete(c.invites, topic)
 	c.mu.Unlock()
 	_ = c.write(frameGuestClose, marshal(hubGuestBody{Topic: topic}))
 }

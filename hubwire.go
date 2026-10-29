@@ -85,7 +85,13 @@ type hubWelcome struct {
 type hubGuestBody struct {
 	Topic string `json:"topic"`
 	TTLMs int64  `json:"ttlMs,omitempty"`
+	// Kind is GuestInvite for an invite window; "" (or a hub that doesn't
+	// know it) is a pairing window, capped at MaxGuestTTL.
+	Kind string `json:"kind,omitempty"`
 }
+
+// GuestInvite is hubGuestBody.Kind for an invite guest topic.
+const GuestInvite = "invite"
 
 type hubTURNBody struct {
 	ID         uint64 `json:"id,omitempty"` // turn.get's, echoed in turn.creds

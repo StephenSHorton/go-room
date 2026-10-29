@@ -20,9 +20,19 @@ import (
 // topics the app allows (by default the topics the server's own rooms have
 // open) and to open guest topics, and guests reach only the one pairing
 // topic a member opened for them.
+//
+// A board peer is another person's device, admitted by AuthorizeBoard when
+// Authorize refuses it (a shared board's member). It may subscribe only to
+// the topics AllowTopic grants it (nothing when AllowTopic is nil), never to
+// a guest topic, can't open guest topics, and gets narrow TURN credentials
+// that relay only to this server's own relayed addresses.
 
-// MaxGuestTTL caps how long a guest topic stays open.
+// MaxGuestTTL caps how long a pairing guest topic stays open.
 const MaxGuestTTL = 10 * time.Minute
+
+// MaxInviteTTL caps how long an invite guest topic stays open: long enough
+// for a voice call.
+const MaxInviteTTL = time.Hour
 
 // HubPeer is one connected client as the hub sees it.
 type HubPeer struct {
@@ -30,20 +40,25 @@ type HubPeer struct {
 	Pub    ed25519.PublicKey
 	Guest  bool
 	Remote netip.AddrPort
+	// Person is set on a board peer: the person (as AuthorizeBoard named
+	// it) whose device this is. "" for the server's own devices and guests.
+	Person string
 }
 
 // HubLimits bound what a hub on someone's desktop will take. Zero values
 // are the defaults in brackets.
 type HubLimits struct {
-	Members         int           // member connections [64]
-	Guests          int           // guest connections [8]
-	HandshakesPerIP int           // handshakes in flight per remote IP (an IPv6 /64 is one) [4]
-	Handshakes      int           // handshakes in flight in total [64]
-	TopicsPerConn   int           // subscriptions per connection [8]
-	GuestsPerMember int           // guest topics one member may have open [2]
-	PubRate         float64       // pub frames per second per connection [50]
-	PubBurst        float64       // [100]
-	FailBackoff     time.Duration // refuse an IP this long after a failed handshake, doubling to 30 s [1 s]; negative: off
+	Members          int           // member connections [64]
+	Guests           int           // guest connections [8]
+	HandshakesPerIP  int           // handshakes in flight per remote IP (an IPv6 /64 is one) [4]
+	Handshakes       int           // handshakes in flight in total [64]
+	TopicsPerConn    int           // subscriptions per connection [8]
+	GuestsPerMember  int           // pairing guest topics one member may have open [2]
+	InvitesPerMember int           // invite guest topics one member may have open, beside those [2]
+	BoardPeers       int           // board peer connections [32]
+	PubRate          float64       // pub frames per second per connection [50]
+	PubBurst         float64       // [100]
+	FailBackoff      time.Duration // refuse an IP this long after a failed handshake, doubling to 30 s [1 s]; negative: off
 }
 
 func (l HubLimits) withDefaults() HubLimits {
@@ -58,6 +73,8 @@ func (l HubLimits) withDefaults() HubLimits {
 	def(&l.Handshakes, 64)
 	def(&l.TopicsPerConn, 8)
 	def(&l.GuestsPerMember, 2)
+	def(&l.InvitesPerMember, 2)
+	def(&l.BoardPeers, 32)
 	if l.PubRate <= 0 {
 		l.PubRate = 50
 	}
@@ -78,10 +95,18 @@ type HubConfig struct {
 	// Authorize decides on a member that proved it holds pub's private key;
 	// nil error admits it. Required.
 	Authorize func(id string, pub ed25519.PublicKey) error
+	// AuthorizeBoard, when set, is asked about a device Authorize refused:
+	// another person's device that is a member of a board this server
+	// serves. It returns the person the device belongs to (a nil error
+	// admits it as a board peer, HubPeer.Person set). It runs outside the
+	// hub's lock.
+	AuthorizeBoard func(id string, pub ed25519.PublicKey) (person string, err error)
 	// AllowTopic decides a member's subscriptions other than open guest
-	// topics. nil: only topics the server's own rooms (Local) have open. It
-	// runs with the hub's lock held: answer from the app's own state and
-	// don't call back into the hub.
+	// topics, and every subscription of a board peer (c.Person set). nil:
+	// a member gets only topics the server's own rooms (Local) have open,
+	// and a board peer gets nothing. It runs with the hub's lock held:
+	// answer from the app's own state and don't call back into the hub.
+	// After the state it reads changes, call Recheck.
 	AllowTopic func(c HubPeer, topic string) bool
 	// TURN, when set, answers turn.get: members get Issue(id), guests
 	// IssueGuest until their topic closes.
@@ -127,6 +152,7 @@ type hubTopic struct {
 
 type guestTopic struct {
 	owner   string // the member that opened it ("" = the server itself)
+	invite  bool   // an invite window (MaxInviteTTL), else a pairing one
 	expires time.Time
 	timer   *time.Timer
 	bridge  Leg
@@ -391,11 +417,20 @@ func (h *Hub) handshake(raw net.Conn, remote netip.AddrPort) (*hubConn, handshak
 			return nil, handshakeFailed
 		}
 		pub := ed25519.PublicKey(hello.Pub)
+		person := ""
 		if err := h.cfg.Authorize(hello.ID, pub); err != nil {
-			h.cfg.Logf("hub: refused %s: %v", hello.ID, err)
-			return nil, handshakeFailed
+			if h.cfg.AuthorizeBoard == nil {
+				h.cfg.Logf("hub: refused %s: %v", hello.ID, err)
+				return nil, handshakeFailed
+			}
+			p, berr := h.cfg.AuthorizeBoard(hello.ID, pub)
+			if berr != nil || p == "" {
+				h.cfg.Logf("hub: refused %s: %v", hello.ID, cmpErr(berr, err))
+				return nil, handshakeFailed
+			}
+			person = p
 		}
-		c.peer = HubPeer{ID: hello.ID, Pub: pub, Remote: remote}
+		c.peer = HubPeer{ID: hello.ID, Pub: pub, Remote: remote, Person: person}
 	}
 	if res := h.register(c); res != handshakeOK {
 		return nil, res
@@ -418,19 +453,27 @@ func (h *Hub) register(c *hubConn) handshakeResult {
 	if h.closed {
 		return handshakeNotOpen
 	}
-	members, guests := 0, 0
+	members, guests, boards := 0, 0, 0
 	for o := range h.conns {
-		if o.peer.Guest {
+		switch {
+		case o.peer.Guest:
 			guests++
-		} else {
+		case o.peer.Person != "":
+			boards++
+		default:
 			members++
 		}
 	}
-	if c.peer.Guest {
+	switch {
+	case c.peer.Guest:
 		if _, open := h.guests[c.guestTopic]; !open || guests >= h.lim.Guests {
 			return handshakeNotOpen
 		}
-	} else if members >= h.lim.Members {
+	case c.peer.Person != "":
+		if boards >= h.lim.BoardPeers {
+			return handshakeNotOpen
+		}
+	case members >= h.lim.Members:
 		return handshakeNotOpen
 	}
 	h.conns[c] = true
@@ -509,6 +552,13 @@ func (h *Hub) gcTopicLocked(topic string) {
 
 // allowedLocked reports whether c may use topic.
 func (h *Hub) allowedLocked(c *hubConn, topic string) bool {
+	if c.peer.Person != "" {
+		// A board peer: only what the app grants it, never a guest topic.
+		if _, guest := h.guests[topic]; guest || h.cfg.AllowTopic == nil {
+			return false
+		}
+		return h.cfg.AllowTopic(c.peer, topic)
+	}
 	if g, open := h.guests[topic]; open && h.now().Before(g.expires) {
 		return !c.peer.Guest || topic == c.guestTopic
 	}
@@ -569,15 +619,25 @@ func (h *Hub) route(topic string, payload []byte, fromConn *hubConn, fromLocal *
 // naming it in their hello are admitted until ttl (at most MaxGuestTTL) or
 // CloseGuest.
 func (h *Hub) OpenGuest(topic string, ttl time.Duration) error {
-	return h.openGuest(topic, ttl, "")
+	return h.openGuest(topic, ttl, "", false)
 }
 
-func (h *Hub) openGuest(topic string, ttl time.Duration, owner string) error {
+// OpenInvite opens an invite guest topic for the server's own invite
+// window (a shared board's invite): as OpenGuest, for at most MaxInviteTTL.
+func (h *Hub) OpenInvite(topic string, ttl time.Duration) error {
+	return h.openGuest(topic, ttl, "", true)
+}
+
+func (h *Hub) openGuest(topic string, ttl time.Duration, owner string, invite bool) error {
 	if topic == "" || len(topic) > 255 {
 		return errors.New("room: bad guest topic")
 	}
-	if ttl <= 0 || ttl > MaxGuestTTL {
-		ttl = MaxGuestTTL
+	max := MaxGuestTTL
+	if invite {
+		max = MaxInviteTTL
+	}
+	if ttl <= 0 || ttl > max {
+		ttl = max
 	}
 	h.mu.Lock()
 	if h.closed {
@@ -585,7 +645,7 @@ func (h *Hub) openGuest(topic string, ttl time.Duration, owner string) error {
 		return ErrClosed
 	}
 	if g := h.guests[topic]; g != nil {
-		if g.owner != owner {
+		if g.owner != owner || g.invite != invite {
 			h.mu.Unlock()
 			return errors.New("room: guest topic held by another member")
 		}
@@ -595,18 +655,21 @@ func (h *Hub) openGuest(topic string, ttl time.Duration, owner string) error {
 		return nil
 	}
 	if owner != "" {
-		n := 0
+		n, limit := 0, h.lim.GuestsPerMember
+		if invite {
+			limit = h.lim.InvitesPerMember
+		}
 		for _, g := range h.guests {
-			if g.owner == owner {
+			if g.owner == owner && g.invite == invite {
 				n++
 			}
 		}
-		if n >= h.lim.GuestsPerMember {
+		if n >= limit {
 			h.mu.Unlock()
 			return errors.New("room: too many guest topics open")
 		}
 	}
-	g := &guestTopic{owner: owner, expires: h.now().Add(ttl)}
+	g := &guestTopic{owner: owner, invite: invite, expires: h.now().Add(ttl)}
 	g.timer = time.AfterFunc(ttl, func() { h.expireGuest(topic, g) })
 	h.guests[topic] = g
 	h.regrantLocked(topic)
@@ -692,6 +755,26 @@ func (h *Hub) Drop(id string) {
 	for _, c := range drop {
 		c.sendNow(frameErr, marshal(hubErrBody{Reason: "revoked"}))
 		c.close()
+	}
+}
+
+// Recheck applies AllowTopic again to every connection: a subscription it
+// no longer allows ends, and one asked for that it now allows starts. Call
+// it after the state AllowTopic reads changes (a board's members or epoch).
+// To drop another person's devices entirely, Drop each of them (Peers lists
+// them with their Person).
+func (h *Hub) Recheck() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for c := range h.conns {
+		for topic := range c.subs {
+			if !h.allowedLocked(c, topic) {
+				h.unsubLocked(c, topic)
+			}
+		}
+		for topic := range c.wants {
+			h.grantLocked(c, topic)
+		}
 	}
 }
 
@@ -803,12 +886,16 @@ func (h *Hub) serveConn(c *hubConn) {
 			if c.peer.Guest {
 				return
 			}
+			if c.peer.Person != "" {
+				h.cfg.Logf("hub: board peer %s may not open guest topics", c.peer.ID)
+				continue
+			}
 			var g hubGuestBody
 			if parseJSON(body, &g) != nil {
 				continue
 			}
 			if typ == frameGuestOpen {
-				if err := h.openGuest(g.Topic, time.Duration(g.TTLMs)*time.Millisecond, c.peer.ID); err != nil {
+				if err := h.openGuest(g.Topic, time.Duration(g.TTLMs)*time.Millisecond, c.peer.ID, g.Kind == GuestInvite); err != nil {
 					h.cfg.Logf("hub: guest.open from %s: %v", c.peer.ID, err)
 				}
 			} else {
@@ -894,6 +981,8 @@ func (h *Hub) turnFor(c *hubConn) hubTURNBody {
 			c.turnUsers = append(c.turnUsers, user)
 			h.mu.Unlock()
 		}
+	} else if c.peer.Person != "" {
+		tc = h.cfg.TURN.IssueBoard(c.peer.Person)
 	} else {
 		tc = h.cfg.TURN.Issue(c.peer.ID)
 	}
@@ -1082,4 +1171,12 @@ func (r *rate) take() bool {
 	}
 	r.tokens--
 	return true
+}
+
+// cmpErr is a when it's set, else b.
+func cmpErr(a, b error) error {
+	if a != nil {
+		return a
+	}
+	return b
 }

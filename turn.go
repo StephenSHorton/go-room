@@ -40,10 +40,12 @@ const (
 	DefaultMaxPerUser   = 8
 	DefaultMaxTotal     = 32
 	DefaultMaxGuests    = 4  // allocations across every guest
+	DefaultMaxBoardUser = 4  // allocations per other person (a board user)
 	DefaultMaxTCP       = 64 // TURN-over-TCP connections
 	DefaultMaxTCPPerIP  = 8
 	turnAllocLifetime   = 10 * time.Minute
 	guestUserPrefix     = "guest-"
+	boardUserPrefix     = "board-"
 	memberHandlePrefix  = "~"
 	turnSrcCap          = 4096 // remembered client addresses (for the peer filter)
 	turnSrcForgetAfter  = time.Hour
@@ -80,19 +82,24 @@ type TURNConfig struct {
 	// connection lasts only as long as the credentials it was made with.
 	TTL time.Duration
 	// Authorize is asked on every authenticated request with the user from
-	// the username (a device id); non-nil refuses. Guest users are checked
-	// by the server itself. nil admits every user with valid credentials.
+	// the username (a device id, or "board-<person>" for another person's
+	// devices, IssueBoard); non-nil refuses. Guest users are checked by the
+	// server itself. nil admits every user with valid credentials.
 	Authorize func(user string) error
 	// AllowPeer decides which peer addresses a user may relay to, on every
 	// permission and every packet out. nil: members to this host's private
 	// subnets and to relayed addresses on this server; guests only to
 	// relayed addresses. Loopback, link-local, multicast and public
-	// addresses are never in the default.
+	// addresses are never in the default. Board users (IssueBoard) relay
+	// only to this server's relayed addresses whatever AllowPeer says.
 	AllowPeer func(user string, ip netip.Addr) bool
 	// MaxPerUser and MaxTotal cap allocations (defaults 8 and 32);
 	// MaxGuests caps the allocations of every guest together (default 4),
 	// so pairing guests never take the relay from members.
 	MaxPerUser, MaxTotal, MaxGuests int
+	// MaxBoardPerUser caps one other person's allocations, across all of
+	// their devices (default 4), inside MaxTotal.
+	MaxBoardPerUser int
 	// MaxTCP and MaxTCPPerIP cap TURN-over-TCP connections (defaults 64
 	// and 8; an IPv6 /64 counts as one IP).
 	MaxTCP, MaxTCPPerIP int
@@ -150,6 +157,9 @@ func NewTURN(cfg TURNConfig) (*TURNServer, error) {
 	}
 	if cfg.MaxGuests <= 0 {
 		cfg.MaxGuests = DefaultMaxGuests
+	}
+	if cfg.MaxBoardPerUser <= 0 {
+		cfg.MaxBoardPerUser = DefaultMaxBoardUser
 	}
 	if cfg.MaxTCP <= 0 {
 		cfg.MaxTCP = DefaultMaxTCP
@@ -215,6 +225,14 @@ func (t *TURNServer) Close() {
 // Issue mints credentials for user (a device id; no ':').
 func (t *TURNServer) Issue(user string) TURNCreds {
 	return t.mint(user, t.now().Add(t.cfg.TTL))
+}
+
+// IssueBoard mints credentials for another person's devices on a shared
+// board: one user per person ("board-" + person, no ':'), so they share
+// MaxBoardPerUser allocations. Their allocations relay only to this
+// server's relayed addresses, never to the LAN.
+func (t *TURNServer) IssueBoard(person string) TURNCreds {
+	return t.Issue(boardUserPrefix + person)
 }
 
 // IssueGuest mints credentials for a pairing guest, valid until until (at
@@ -417,20 +435,23 @@ func (t *TURNServer) permit(client net.Addr, peer net.IP) bool {
 // allowPeer applies AllowPeer or the default. port is the destination port
 // when a packet is being sent (0 for a permission).
 func (t *TURNServer) allowPeer(user string, ip netip.Addr, port uint16) bool {
+	relayed := func() bool {
+		r := ip == t.cfg.RelayIP
+		if r && port != 0 {
+			t.mu.Lock()
+			r = t.relays[port]
+			t.mu.Unlock()
+		}
+		return r
+	}
+	if strings.HasPrefix(user, boardUserPrefix) {
+		return relayed() // other people never reach the LAN, whatever AllowPeer says
+	}
 	if t.cfg.AllowPeer != nil {
 		return t.cfg.AllowPeer(user, ip)
 	}
-	relayed := ip == t.cfg.RelayIP
-	if relayed && port != 0 {
-		t.mu.Lock()
-		relayed = t.relays[port]
-		t.mu.Unlock()
-	}
-	if strings.HasPrefix(user, guestUserPrefix) {
-		return relayed
-	}
-	if relayed {
-		return true
+	if r := relayed(); r || strings.HasPrefix(user, guestUserPrefix) {
+		return r
 	}
 	if !ip.Is4() || !ip.IsPrivate() {
 		return false // loopback, link-local, multicast, unspecified and public all fail here
@@ -466,6 +487,9 @@ func (g *turnRelayGen) AllocatePacketConn(conf turn.AllocateListenerConfig) (net
 	case guest && t.guestTotal >= t.cfg.MaxGuests:
 		t.mu.Unlock()
 		return nil, nil, errTURNServerQuota
+	case strings.HasPrefix(conf.UserID, boardUserPrefix) && t.users[conf.UserID] >= t.cfg.MaxBoardPerUser:
+		t.mu.Unlock()
+		return nil, nil, errTURNUserQuota
 	case t.users[conf.UserID] >= t.cfg.MaxPerUser:
 		t.mu.Unlock()
 		return nil, nil, errTURNUserQuota
